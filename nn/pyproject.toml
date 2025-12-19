@@ -16,6 +16,7 @@ dependencies = [
     "notebook>=7.5.0",
     "pandas>=2.1.0",
     "rasterio>=1.4.3",
+    "rouge-score>=0.1.2",
     "seaborn>=0.13.2",
     "tensorboard>=2.13.0",
     "tensorflow==2.13.0",
