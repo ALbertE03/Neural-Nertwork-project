@@ -1,6 +1,10 @@
 from vocabulary import Vocabulary
 from constant import *
 from config import Config
+from dataset import PGNDataset, pgn_collate_fn
+import torch
+from torch.utils.data import DataLoader
+
 
 vocab = Vocabulary(
     CREATE_VOCABULARY=CREATE_VOCABULARY,
@@ -15,7 +19,7 @@ vocab = Vocabulary(
 )
 vocab.build_vocabulary()
 
-cfg = Config(
+config = Config(
     max_vocab_size=vocab.total_size(),
     src_len=MAX_LEN_SRC,
     tgt_len=MAX_LEN_TGT,
@@ -47,4 +51,32 @@ cfg = Config(
     gpu_id=GPU_ID,
 )
 
-print(cfg)
+train_dataset = PGNDataset(
+    vocab=vocab,
+    MAX_LEN_SRC=config['src_len'],
+    MAX_LEN_TGT=config['tgt_len'],
+    data_dir=config['data_path'],
+    split='train' 
+)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=config['train_batch_size'],
+    shuffle=False,
+    collate_fn=pgn_collate_fn
+)
+
+val_dataset = PGNDataset(
+    vocab=vocab,
+    MAX_LEN_SRC=config['src_len'],
+    MAX_LEN_TGT=config['tgt_len'],
+    data_dir=config['data_path'],
+    split='val' 
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=config['eval_batch_size'],
+    shuffle=False,
+    collate_fn=pgn_collate_fn
+)
