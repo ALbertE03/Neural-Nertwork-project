@@ -6,9 +6,11 @@ import os
 # =================================================
 # DATA / VOCABULARY
 # =================================================
-DATA_DIR = "/Users/alberto/Desktop/Neural-Nertwork-project/nn/PNL/data/"
+# Rutas relativas al directorio del proyecto
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 VOCAB_NAME = "Vocabulary.json"
-CHECKPOINT_VOCABULARY_DIR = "/Users/alberto/Desktop/Neural-Nertwork-project/nn/PNL/saved/working/"
+CHECKPOINT_VOCABULARY_DIR = os.path.join(BASE_DIR, "saved", "working")
 
 MAX_VOCAB_SIZE = 50000
 MAX_LEN_SRC = 400
@@ -54,7 +56,7 @@ ITERS_PER_EPOCH = 400
 TRAIN_BATCH_SIZE = 32
 EVAL_BATCH_SIZE = 32
 
-LEARNER = "schedule"
+LEARNER = "adam"
 LEARNING_RATE = 1e-3
 
 GRAD_CLIP = 1.0
@@ -75,6 +77,6 @@ REPRODUCIBILITY = True
 # =================================================
 # PATHS / LOGGING
 # =================================================
-CHECKPOINT_DIR = "/Users/alberto/Desktop/Neural-Nertwork-project/nn/PNL/saved/"
-GENERATED_TEXT_DIR = "/Users/alberto/Desktop/Neural-Nertwork-project/nn/PNL/generated/"
-PLOT = True
+CHECKPOINT_DIR = os.path.join(BASE_DIR, "saved")
+GENERATED_TEXT_DIR = os.path.join(BASE_DIR, "generated")
+PLOT = False
