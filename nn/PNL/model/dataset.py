@@ -155,6 +155,17 @@ class PGNDataset(Dataset):
 
 def pgn_collate_fn(batch):
     """Función para combinar muestras en batches"""
+    # Filtrar ejemplos con encoder_length <= 0
+    filter_batch = []
+    for x in batch:
+        if x['encoder_length'].item() > 0:
+            filter_batch.append(x)
+    
+    # Si todos los ejemplos fueron filtrados, retornar None
+    if len(filter_batch) == 0:
+        return None
+    
+    batch = filter_batch
     max_oov = max(x["max_oov_len"] for x in batch)
     
     def pad_oov(words):

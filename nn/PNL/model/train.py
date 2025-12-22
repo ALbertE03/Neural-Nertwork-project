@@ -139,6 +139,8 @@ class Trainer:
         pbar = tqdm(train_loader, desc=f"Training", total=len(train_loader))
         
         for batch_idx, batch in enumerate(pbar):
+            if batch is None:
+                continue
             self.optimizer.zero_grad()
             
             # Forward pass
@@ -200,6 +202,8 @@ class Trainer:
             pbar = tqdm(val_loader, desc=f"Validation", total=len(val_loader))
             
             for batch in pbar:
+                if batch is None:
+                    continue
                 outputs = self.model(batch, is_training=True)
                 
                 total_loss += outputs['loss'].item()
