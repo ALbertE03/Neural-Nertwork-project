@@ -29,18 +29,18 @@ CREATE_VOCABULARY = not os.path.exists(
 # =================================================
 # MODEL ARCHITECTURE
 # =================================================
-EMBEDDING_SIZE = 128
-HIDDEN_SIZE = 256
+EMBEDDING_SIZE = 256
+HIDDEN_SIZE = 512
 
 NUM_ENC_LAYERS = 1
 NUM_DEC_LAYERS = 1
 BIDIRECTIONAL = True
-  # Aumentar dropout para regularización
+ 
 
 IS_ATTENTION = True
 IS_PGEN = True
 IS_COVERAGE = True
-COV_LOSS_LAMBDA = 3.0  # Aumentado de 1.0 a 5.0 para penalizar repeticiones
+COV_LOSS_LAMBDA = 3.0 
 
 # =================================================
 # DECODING
@@ -55,9 +55,9 @@ ITERS_PER_EPOCH = None
 
 
 
-LEARNER = "adagrad"
+LEARNER = "adam"
 
-LEARNING_RATE = 0.15  
+LEARNING_RATE = 0.001  
 GRAD_CLIP = 2.0  
 TRAIN_BATCH_SIZE = 64  
 EVAL_BATCH_SIZE = 64
