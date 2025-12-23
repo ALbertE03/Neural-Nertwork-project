@@ -35,12 +35,12 @@ HIDDEN_SIZE = 256
 NUM_ENC_LAYERS = 1
 NUM_DEC_LAYERS = 1
 BIDIRECTIONAL = True
-DROPOUT_RATIO = 0.2
+  # Aumentar dropout para regularización
 
 IS_ATTENTION = True
 IS_PGEN = True
 IS_COVERAGE = True
-COV_LOSS_LAMBDA = 1.0
+COV_LOSS_LAMBDA = 3.0  # Aumentado de 1.0 a 5.0 para penalizar repeticiones
 
 # =================================================
 # DECODING
@@ -50,19 +50,21 @@ BEAM_SIZE = 5
 
 
 EPOCHS = 30
-WARMUP_EPOCHS = None
-ITERS_PER_EPOCH = None  # None = procesar todo el dataset
+WARMUP_EPOCHS = 0
+ITERS_PER_EPOCH = None  
 
-TRAIN_BATCH_SIZE = 32
-EVAL_BATCH_SIZE = 32
 
-LEARNER = "adam"
-LEARNING_RATE = 0.01
 
-GRAD_CLIP = 1.0
+LEARNER = "adagrad"
 
+LEARNING_RATE = 0.15  
+GRAD_CLIP = 2.0  
+TRAIN_BATCH_SIZE = 64  
+EVAL_BATCH_SIZE = 64
 SAVE_HISTORY = True
 SAVE_MODEL_EPOCH = True
+DROPOUT_RATIO = 0.3
+
 
 # =================================================
 # GPU / REPRODUCIBILITY

@@ -113,7 +113,13 @@ def build_optimizer(model, config):
     """
     learner_type = (config['learner'] if config['learner'] else 'adam').lower()
     learning_rate = config['learning_rate']
-    
+    if learning_rate =='adagrad':
+        base_optimizer = optim.Adagrad(
+            model.parameters(),
+            lr=learning_rate,
+            epsilon=1e-6,
+            initial_accumulator_value=0.1
+        )
     if learner_type == 'adam':
         base_optimizer = optim.Adam(
             model.parameters(),
