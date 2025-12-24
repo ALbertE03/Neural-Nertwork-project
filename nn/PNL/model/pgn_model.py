@@ -12,11 +12,12 @@ class PointerGeneratorNetwork(nn.Module):
     (See et al., 2017) - https://arxiv.org/abs/1704.04368
     """
     
-    def __init__(self, config, vocab):
+    def __init__(self, config, vocab, pretrained_weights=None):
         """
         Args:
             config: Objeto Config con hiperparámetros
             vocab: Objeto Vocabulary
+            pretrained_weights: Tensor con pesos pre-entrenados (opcional)
         """
         super(PointerGeneratorNetwork, self).__init__()
         
@@ -31,7 +32,8 @@ class PointerGeneratorNetwork(nn.Module):
             hidden_size=config['hidden_size'],
             num_enc_layers=config['num_enc_layers'],  
             dropout_ratio=config['dropout_ratio'],
-            bidirectional=config['bidirectional']
+            bidirectional=config['bidirectional'],
+            pretrained_weights=pretrained_weights
         )
         
         # Decoder

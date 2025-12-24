@@ -2,7 +2,7 @@ import os
 from collections import Counter
 import json
 import re
-
+import spacy
 class Vocabulary:
     def __init__(self, CREATE_VOCABULARY,
                  PAD_TOKEN, UNK_TOKEN,
@@ -15,7 +15,13 @@ class Vocabulary:
         self.data_dir = DATA_DIR
         self.max_vocab_size = MAX_VOCAB_SIZE
         self._c = 0
-
+        try:
+            # Habilitamos 'ner' por si el usuario decide usar entidades, pero dejamos 'parser' deshabilitado por velocidad.
+            self.nlp = spacy.load("es_core_news_lg", disable=['parser'])
+        except OSError:
+            print("Descargando modelo de spaCy español (Large)...")
+            spacy.cli.download("es_core_news_lg")
+            self.nlp = spacy.load("es_core_news_lg", disable=['parser'])
         # Token de Relleno (Padding) - Usado para igualar longitudes de secuencias.
         self.pad_token = PAD_TOKEN
         # Token Desconocido (Unknown) - Usado para palabras no vistas en el vocabulario.
@@ -134,8 +140,24 @@ class Vocabulary:
         return self._c    
         
     def preprocess_text(self,text):
+        text = text.replace('\xa0', ' ')
         text = re.sub(r'\s+', ' ', text)
-        return text.split()
+
+        # 2. Procesamiento con spaCy
+        doc = self.nlp(text)
+        
+        # 3. Extracción de tokens limpios
+        tokens = []
+        for token in doc:
+            t = token.text
+            
+            # Normalizar las comillas 
+            t = t.replace('``', '"').replace("''", '"')
+            
+            # Filtro de seguridad para no guardar tokens vacíos
+            if t.strip():
+                tokens.append(t)
+        return tokens
 
     
     def _save_vocabulary(self):
@@ -224,4 +246,111 @@ class Vocabulary:
         if not self.create_vocabulary:
             return self._load_vocabulary()
         return self._create_vocabulary()
+
+    def load_pretrained_embeddings(self, embedding_path, embedding_dim):
+        """
+        Carga embeddings pre-entrenados y los alinea con el vocabulario actual.
+        Solo realiza coincidencias EXACTAS. Las palabras no encontradas (incluyendo
+        variaciones de mayúsculas/minúsculas no presentes en el archivo) serán
+        aprendidas por el modelo durante el entrenamiento.
+        """
+        import torch
+        import numpy as np
+        from tqdm import tqdm
+
+        # 1. Verificar si el archivo existe, si no, descargar SBW (News) por defecto
+        if embedding_path is not None and not os.path.exists(embedding_path):
+            print(f"⚠ Archivo {embedding_path} no encontrado.")
+            if "sbw_news.vec" in embedding_path:
+                print("Iniciando descarga automática de SBW News Embeddings (Noticias en español)...")
+                self.download_spanish_embeddings(os.path.dirname(embedding_path), type='sbw')
+            elif "wiki.es.vec" in embedding_path:
+                print("Iniciando descarga automática de FastText Spanish...")
+                self.download_spanish_embeddings(os.path.dirname(embedding_path), type='fasttext')
+            else:
+                print("Usando inicialización aleatoria.")
+                return torch.randn(len(self.id_to_word), embedding_dim) * 0.1
+
+        vocab_size = len(self.id_to_word)
+        # Inicialización aleatoria para que el modelo "aprenda" lo que no esté en los embeddings
+        weights = torch.randn(vocab_size, embedding_dim) * 0.1
+        
+        if embedding_path is None:
+            return weights
+
+        print(f"Cargando embeddings (Solo Coincidencias Exactas) desde {embedding_path}...")
+        
+        found_indices = set()
+        
+        try:
+            with open(embedding_path, 'r', encoding='utf-8', errors='ignore') as f:
+                header = f.readline().split()
+                if len(header) != 2:
+                    f.seek(0)
+                
+                for line in tqdm(f, desc="Alineando embeddings"):
+                    parts = line.rstrip().split(' ')
+                    if len(parts) < embedding_dim + 1:
+                        continue
+                        
+                    emb_word = parts[0]
+                    
+                    # Búsqueda Exacta ÚNICAMENTE
+                    if emb_word in self.word_to_id:
+                        idx = self.word_to_id[emb_word]
+                        if idx not in found_indices:
+                            vec = np.array([float(x) for x in parts[1:embedding_dim+1]])
+                            weights[idx] = torch.from_numpy(vec)
+                            found_indices.add(idx)
+                                
+            print(f"✓ Cobertura Exacta: {len(found_indices)} / {vocab_size} ({len(found_indices)/vocab_size*100:.1f}%)")
+            print(f"  - Las {vocab_size - len(found_indices)} palabras restantes serán aprendidas desde cero.")
+
+            if self.pad_token in self.word_to_id:
+                weights[self.word_to_id[self.pad_token]] = torch.zeros(embedding_dim)
+                
+        except Exception as e:
+            print(f"✗ Error cargando embeddings: {e}")
+            
+        return weights
+
+    def download_spanish_embeddings(self, target_dir, type='sbw'):
+        """
+        Descarga y extrae vectores pre-entrenados.
+        type: 'fasttext' (Wikipedia/CC) o 'sbw' (Spanish Billion Words - Noticias/Libros)
+        """
+        import urllib.request
+        import os
+        import gzip
+        import shutil
+
+        os.makedirs(target_dir, exist_ok=True)
+        
+        if type == 'sbw':
+            # Spanish Billion Words (Más orientado a Noticias/Libros)
+            url = "http://dcc.uchile.cl/~jperez/word-embeddings/glove-sbwc.i2e.300d.vec.gz"
+            target_name = "sbw_news.vec"
+        else:
+            # FastText CC Spanish
+            url = "https://dl.fbaipublicfiles.com/fasttext/vectors-crawl/cc.es.300.vec.gz"
+            target_name = "wiki.es.vec"
+
+        gz_path = os.path.join(target_dir, f"{target_name}.gz")
+        vec_path = os.path.join(target_dir, target_name)
+        
+        print(f"Descargando embeddings de tipo '{type}' desde {url}...")
+        try:
+            urllib.request.urlretrieve(url, gz_path)
+            print(f"✓ Descarga completada. Descomprimiendo en {vec_path}...")
+            
+            with gzip.open(gz_path, 'rb') as f_in:
+                with open(vec_path, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            
+            print(f"✓ Extracción completada.")
+            os.remove(gz_path) 
+            return vec_path
+        except Exception as e:
+            print(f"✗ Error descargando: {e}")
+            return None
         

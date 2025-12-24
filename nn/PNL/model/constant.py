@@ -12,6 +12,9 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 VOCAB_NAME = "Vocabulary.json"
 CHECKPOINT_VOCABULARY_DIR = os.path.join(BASE_DIR, "saved", "working")
 
+# Ruta a embeddings pre-entrenados 
+EMBEDDING_PATH = os.path.join(DATA_DIR, "wiki.es.vec")
+
 MAX_VOCAB_SIZE = 50000
 MAX_LEN_SRC = 400
 MAX_LEN_TGT = 50
@@ -29,8 +32,8 @@ CREATE_VOCABULARY = not os.path.exists(
 # =================================================
 # MODEL ARCHITECTURE
 # =================================================
-EMBEDDING_SIZE = 256
-HIDDEN_SIZE = 512
+EMBEDDING_SIZE = 300 # Cambiado a 300 para FastText Spanish
+HIDDEN_SIZE = 600
 
 NUM_ENC_LAYERS = 1
 NUM_DEC_LAYERS = 1

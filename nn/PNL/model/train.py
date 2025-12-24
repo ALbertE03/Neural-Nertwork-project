@@ -19,18 +19,19 @@ class Trainer:
     Clase para entrenar el modelo Pointer-Generator Network.
     """
     
-    def __init__(self, config, vocab):
+    def __init__(self, config, vocab, pretrained_weights=None):
         """
         Args:
             config: Config object
             vocab: Vocabulary object
+            pretrained_weights: Tensor con pesos pre-entrenados (opcional)
         """
         self.config = config
         self.vocab = vocab
         self.device = config['device']
         
         # Modelo
-        self.model = PointerGeneratorNetwork(config, vocab).to(self.device)
+        self.model = PointerGeneratorNetwork(config, vocab, pretrained_weights).to(self.device)
         
         # Optimizer
         self.optimizer = build_optimizer(self.model, config)
@@ -378,12 +379,21 @@ def main():
         learning_rate=LEARNING_RATE,
         iters_per_epoch=ITERS_PER_EPOCH,
         gpu_id=GPU_ID,
-        warmup_epochs=WARMUP_EPOCHS
+        warmup_epochs=WARMUP_EPOCHS,
+        embedding_path=EMBEDDING_PATH
     )
     
     print(config)
+
+    # 4. Cargar embeddings pre-entrenados (OPCIONAL)
+    pretrained_weights = None
+    if config['embedding_path'] is not None:
+        pretrained_weights = vocab.load_pretrained_embeddings(
+            config['embedding_path'], 
+            config['embedding_size']
+        )
     
-    # 4. Crear datasets
+    # 5. Crear datasets
     print("\nCargando datasets...")
     train_dataset = PGNDataset(
         vocab=vocab,
@@ -424,7 +434,7 @@ def main():
     )
     
     # 6. Crear trainer
-    trainer = Trainer(config, vocab)
+    trainer = Trainer(config, vocab, pretrained_weights)
     
     # 7. Buscar y cargar checkpoint automáticamente
     latest_checkpoint = trainer.find_latest_checkpoint()

@@ -6,7 +6,7 @@ class Encoder(nn.Module):
     Encoder bidireccional LSTM para el modelo Pointer-Generator.
     """
     
-    def __init__(self, vocab_size, embedding_size, hidden_size, num_enc_layers, dropout_ratio, bidirectional):
+    def __init__(self, vocab_size, embedding_size, hidden_size, num_enc_layers, dropout_ratio, bidirectional, pretrained_weights=None):
         """
         Args:
             vocab_size: Tamaño del vocabulario base (sin OOVs)
@@ -15,6 +15,7 @@ class Encoder(nn.Module):
             num_enc_layers: Número de capas del LSTM
             dropout_ratio: Probabilidad de dropout
             bidirectional: Si el LSTM es bidireccional
+            pretrained_weights: Tensor con pesos pre-entrenados (opcional)
         """
         super(Encoder, self).__init__()
         
@@ -26,6 +27,11 @@ class Encoder(nn.Module):
         
         # Embedding layer (solo para vocabulario base)
         self.embedding = nn.Embedding(vocab_size, embedding_size, padding_idx=0)
+        
+        if pretrained_weights is not None:
+            self.embedding.weight.data.copy_(pretrained_weights)
+            self.embedding.weight.requires_grad = True # Ahora son entrenables (Fine-tuning)
+            print("✓ Encoder: Pesos de embedding inicializados (Entrenables para Fine-tuning).")
         
         # LSTM bidireccional
         self.lstm = nn.LSTM(
