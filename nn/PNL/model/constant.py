@@ -32,7 +32,7 @@ CREATE_VOCABULARY = not os.path.exists(
 # =================================================
 # MODEL ARCHITECTURE
 # =================================================
-EMBEDDING_SIZE = 300 # Cambiado a 300 para FastText Spanish
+EMBEDDING_SIZE = 300 
 HIDDEN_SIZE = 600
 
 NUM_ENC_LAYERS = 1

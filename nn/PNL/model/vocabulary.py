@@ -3,6 +3,7 @@ from collections import Counter
 import json
 import re
 import spacy
+
 class Vocabulary:
     def __init__(self, CREATE_VOCABULARY,
                  PAD_TOKEN, UNK_TOKEN,
@@ -16,12 +17,11 @@ class Vocabulary:
         self.max_vocab_size = MAX_VOCAB_SIZE
         self._c = 0
         try:
-            # Habilitamos 'ner' por si el usuario decide usar entidades, pero dejamos 'parser' deshabilitado por velocidad.
-            self.nlp = spacy.load("es_core_news_lg", disable=['parser'])
+            self.nlp = spacy.load("es_core_news_sm", disable=['parser','ner'])
         except OSError:
             print("Descargando modelo de spaCy español (Large)...")
-            spacy.cli.download("es_core_news_lg")
-            self.nlp = spacy.load("es_core_news_lg", disable=['parser'])
+            spacy.cli.download("es_core_news_sm")
+            self.nlp = spacy.load("es_core_news_sm", disable=['parser','ner'])
         # Token de Relleno (Padding) - Usado para igualar longitudes de secuencias.
         self.pad_token = PAD_TOKEN
         # Token Desconocido (Unknown) - Usado para palabras no vistas en el vocabulario.
@@ -139,25 +139,58 @@ class Vocabulary:
         """Retorna el tamaño real de el vocabulario"""
         return self._c    
         
-    def preprocess_text(self,text):
-        text = text.replace('\xa0', ' ')
-        text = re.sub(r'\s+', ' ', text)
-
-        # 2. Procesamiento con spaCy
-        doc = self.nlp(text)
+    def _clean_text(self, text):
+        """Limpieza inicial de texto antes de pasar por spaCy."""
+        # 1. Quitar HTML
+        text = re.sub(r'<[^>]+>', ' ', text)
         
-        # 3. Extracción de tokens limpios
+        # 2. Quitar URLs
+        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+        text = re.sub(url_pattern, ' ', text)
+
+        # 3. Limpieza de caracteres especiales y ruido
+        text = text.replace('\xa0', ' ')
+        # Caracteres decorativos repetidos
+        text = re.sub(r'[~*\-_=]{2,}', ' ', text)
+        # Elipses
+        text = text.replace('...', ' ')
+        
+        # 4. Normalizar espacios (Mantenemos fechas y números aquí)
+        return re.sub(r'\s+', ' ', text).strip()
+
+    def _tokens_from_doc(self, doc, for_vocab=False):
+        """Extrae y filtra tokens de un doc de spaCy."""
         tokens = []
         for token in doc:
+            
+
+            # Si estamos filtrando para el VOCABULARIO
+            if for_vocab:
+                # Omitimos Números y Fechas en el vocabulario fijo
+                # (El PGN los manejará como OOVs y los copiará del texto original)
+                if token.like_num or token.pos_ == "NUM":
+                    continue
+                # Intento de detectar fechas por forma básica
+                if re.match(r'\d+[/-]\d+', token.text):
+                    continue
+            
+            # Filtros comunes (Puntuación ruidosa, brackets, quotes)
+            if token.is_punct and token.text not in ['.', ',', '!', '?','¿']:
+                continue
+            if token.is_bracket or token.is_quote:
+                continue
+            
             t = token.text
-            
-            # Normalizar las comillas 
             t = t.replace('``', '"').replace("''", '"')
-            
-            # Filtro de seguridad para no guardar tokens vacíos
-            if t.strip():
+            if t:
                 tokens.append(t)
         return tokens
+
+    def process_text(self, text):
+        """Procesa un único texto para el modelo (mantiene fechas/números)."""
+        text = self._clean_text(text)
+        doc = self.nlp(text)
+        return self._tokens_from_doc(doc, for_vocab=False)
 
     
     def _save_vocabulary(self):
@@ -214,11 +247,21 @@ class Vocabulary:
         all_words = []
        
         word_counts = Counter()
+       
         for file_path in all_files:
             with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    tokens = self.preprocess_text(line)
-                    word_counts.update(tokens)
+                lines = f.readlines()
+            
+            # Limpieza inicial en paralelo (str processing)
+            cleaned_lines = [self._clean_text(line) for line in lines]
+            
+            # Procesamiento por batches con spaCy
+            for doc in tqdm(self.nlp.pipe(cleaned_lines, batch_size=500), 
+                           total=len(cleaned_lines), 
+                           desc=f"Procesando {os.path.basename(file_path)}"):
+                # Para el vocabulario usamos for_vocab=True para filtrar números/fechas
+                tokens = self._tokens_from_doc(doc, for_vocab=True)
+                word_counts.update(tokens)
       
         # Calcular cuántas palabras regulares podemos añadir:
         if self.max_vocab_size <= self.num_special_tokens:

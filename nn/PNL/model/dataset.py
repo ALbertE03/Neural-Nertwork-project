@@ -88,7 +88,7 @@ class PGNDataset(Dataset):
         trimmed_src_tokens = []
         
         for sentence in raw_sentences:
-            sentence_tokens = self.vocab.preprocess_text(sentence.strip())
+            sentence_tokens = self.vocab.process_text(sentence.strip())
             if not sentence_tokens:
                 continue
             
@@ -118,7 +118,7 @@ class PGNDataset(Dataset):
         ]
         
         # --- 3. Decoder ---
-        tgt_tokens = self.vocab.preprocess_text(tgt_line)
+        tgt_tokens = self.vocab.process_text(tgt_line)
         tgt_ext_ids = self._map_target_to_extended_ids(tgt_tokens, oov_map)
         
         MAX_RAW_TGT_LEN = self.MAX_LEN_TGT - 1
