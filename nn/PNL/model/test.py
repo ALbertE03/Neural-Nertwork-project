@@ -201,6 +201,7 @@ class Evaluator:
         meteor_scores = []
         copy_rates = []
         bigram_overlaps = []
+        p_gen_avgs = [] # Promedio de p_gen por ejemplo
         
         test_loss = 0.0
         num_batches = 0
@@ -245,9 +246,25 @@ class Evaluator:
                     if self.config['decoding_strategy'] == 'beam_search':
                         hypothesis = self.beam_search.search(single_batch)
                         generated_ids = hypothesis.tokens[1:]  # Quitar START
+                        # Extraer p_gens de la hipótesis (lista de tensores (1,1))
+                        p_gens_list = hypothesis.p_gens
+                        if p_gens_list:
+                            p_gens_tensor = torch.cat(p_gens_list).squeeze() # (tgt_len,)
+                        else:
+                            p_gens_tensor = torch.tensor([])
+                            
                     else:  # greedy
-                        generated_ids = self.model.decode_greedy(single_batch, max_len=self.config['tgt_len'])
+                        generated_ids, p_gens_tensor = self.model.decode_greedy(single_batch, max_len=self.config['tgt_len'])
                         generated_ids = generated_ids[0].cpu().tolist()
+                        p_gens_tensor = p_gens_tensor[0].squeeze(-1).cpu() # (max_len,)
+                    
+                    # Calcular promedio de p_gen para este ejemplo
+                    if p_gens_tensor.numel() > 0:
+                        avg_p_gen_example = p_gens_tensor.mean().item()
+                    else:
+                        avg_p_gen_example = 0.0
+                        
+                    p_gen_avgs.append(avg_p_gen_example)
                     
                     # Decodificar a texto
                     target_ids = single_batch['decoder_target'][0].cpu().tolist()
@@ -285,7 +302,9 @@ class Evaluator:
                         'rougeL_f1': rouge_scores['rouge-l']['f'],
                         'meteor': meteor,
                         'copy_rate': copy_rate,
-                        'bigram_overlap': bigram_overlap
+                        'bigram_overlap': bigram_overlap,
+                        'avg_p_gen': avg_p_gen_example,
+                        'avg_p_copy': 1.0 - avg_p_gen_example
                     }
                     results.append(result)
                     
@@ -297,7 +316,8 @@ class Evaluator:
                         'RL': f"{np.mean(rougeL_scores):.4f}",
                         'M': f"{np.mean(meteor_scores):.4f}",
                         'Copy': f"{np.mean(copy_rates):.2f}",
-                        'BiOv': f"{np.mean(bigram_overlaps):.2f}"
+                        'BiOv': f"{np.mean(bigram_overlaps):.2f}",
+                        'P_Gen': f"{np.mean(p_gen_avgs):.2f}"
                     })
                     
                     if num_examples and len(results) >= num_examples:
@@ -317,6 +337,8 @@ class Evaluator:
         
         avg_copy_rate = np.mean(copy_rates) if copy_rates else 0.0
         avg_bigram_overlap = np.mean(bigram_overlaps) if bigram_overlaps else 0.0
+        avg_p_gen = np.mean(p_gen_avgs) if p_gen_avgs else 0.0
+        
         metrics = {
             'test_loss': avg_test_loss,
             'rouge1_f1': avg_rouge1,
@@ -325,6 +347,8 @@ class Evaluator:
             'meteor': avg_meteor,
             'copy_rate': avg_copy_rate,
             'bigram_overlap': avg_bigram_overlap,
+            'avg_p_gen': avg_p_gen,
+            'avg_p_copy': 1.0 - avg_p_gen,
             'num_examples': len(results)
         }
         
@@ -366,6 +390,8 @@ class Evaluator:
             f.write(f"METEOR: {metrics['meteor']:.4f}\n")
             f.write(f"Copy Rate: {metrics['copy_rate']:.4f}\n")
             f.write(f"Bigram Overlap: {metrics['bigram_overlap']:.4f}\n")
+            f.write(f"Avg P_Gen: {metrics['avg_p_gen']:.4f}\n")
+            f.write(f"Avg P_Copy: {metrics['avg_p_copy']:.4f}\n")
             f.write(f"Ejemplos evaluados: {metrics['num_examples']}\n")
             f.write(f"{'='*60}\n\n")
             
@@ -380,7 +406,9 @@ class Evaluator:
                 f.write(f"ROUGE-L: {result['rougeL_f1']:.4f} | ")
                 f.write(f"METEOR: {result['meteor']:.4f} | ")
                 f.write(f"Copy Rate: {result['copy_rate']:.4f} | ")
-                f.write(f"Bigram Overlap: {result['bigram_overlap']:.4f}\n\n")
+                f.write(f"Bigram Overlap: {result['bigram_overlap']:.4f} | ")
+                f.write(f"P_Gen: {result['avg_p_gen']:.4f} | ")
+                f.write(f"P_Copy: {result['avg_p_copy']:.4f}\n\n")
         
         print(f"✓ Resultados legibles en {txt_path}")
 
@@ -577,7 +605,8 @@ def main():
         print(f"ROUGE-1: {result['rouge1_f1']:.4f} | "
               f"ROUGE-2: {result['rouge2_f1']:.4f} | "
               f"ROUGE-L: {result['rougeL_f1']:.4f} | "
-              f"METEOR: {result['meteor']:.4f}")
+              f"METEOR: {result['meteor']:.4f} | "
+              f"P_Gen: {result['avg_p_gen']:.4f}")
         print()
 
 

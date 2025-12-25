@@ -7,22 +7,25 @@ class Hypothesis:
     """
     Representa una hipótesis durante beam search.
     """
-    def __init__(self, tokens, log_probs, decoder_state, context_vector, coverage):
+    def __init__(self, tokens, log_probs, decoder_state, context_vector, coverage, p_gens=None):
         """
         Args:
             tokens: List[int] - Secuencia de tokens generados
             log_probs: List[float] - Log probabilities de cada token
             decoder_state: Tuple (h, c) - Estado del decoder
             context_vector: Tensor - Context vector actual
+            context_vector: Tensor - Context vector actual
             coverage: Tensor - Coverage acumulado
+            p_gens: List[Tensor] - Lista de p_gen para cada paso
         """
         self.tokens = tokens
         self.log_probs = log_probs
         self.decoder_state = decoder_state
         self.context_vector = context_vector
         self.coverage = coverage
+        self.p_gens = p_gens if p_gens is not None else []
     
-    def extend(self, token, log_prob, decoder_state, context_vector, coverage):
+    def extend(self, token, log_prob, decoder_state, context_vector, coverage, p_gen):
         """
         Extiende la hipótesis con un nuevo token.
         
@@ -34,7 +37,8 @@ class Hypothesis:
             log_probs=self.log_probs + [log_prob],
             decoder_state=decoder_state,
             context_vector=context_vector,
-            coverage=coverage
+            coverage=coverage,
+            p_gens=self.p_gens + [p_gen]
         )
     
     @property
@@ -110,7 +114,8 @@ class BeamSearch:
             log_probs=[0.0],
             decoder_state=decoder_state,
             context_vector=initial_context,
-            coverage=initial_coverage
+            coverage=initial_coverage,
+            p_gens=[]
         )
         
         hypotheses = [initial_hyp]  # Beam actual
@@ -180,7 +185,8 @@ class BeamSearch:
                         log_prob=token_log_prob,
                         decoder_state=new_decoder_state,
                         context_vector=new_context,
-                        coverage=new_coverage
+                        coverage=new_coverage,
+                        p_gen=p_gen if p_gen is not None else torch.tensor([[1.0]], device=self.device)
                     )
                     
                     all_candidates.append(new_hyp)

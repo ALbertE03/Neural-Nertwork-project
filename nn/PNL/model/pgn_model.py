@@ -252,7 +252,8 @@ class PointerGeneratorNetwork(nn.Module):
         )
         
         generated_ids = []
-        
+        p_gens = []
+                
         for t in range(max_len):
             final_dist, decoder_state, context_vector, attention_dist, p_gen, coverage = self.decoder(
                 decoder_input=decoder_input,
@@ -268,6 +269,12 @@ class PointerGeneratorNetwork(nn.Module):
             predicted_ids = torch.argmax(final_dist, dim=1)  # (batch_size,)
             generated_ids.append(predicted_ids)
             
+            # Guardamos p_gen (si es None por no-pgen, guardamos 1.0 = generación pura)
+            if p_gen is not None:
+                p_gens.append(p_gen)
+            else:
+                p_gens.append(torch.ones(batch_size, 1, device=self.device))
+            
             # Próximo input: convertir OOVs a UNK
             decoder_input = torch.where(
                 predicted_ids < self.vocab_size,
@@ -276,4 +283,5 @@ class PointerGeneratorNetwork(nn.Module):
             )
         
         generated_ids = torch.stack(generated_ids, dim=1)  # (batch_size, max_len)
-        return generated_ids
+        p_gens = torch.stack(p_gens, dim=1) # (batch_size, max_len, 1)
+        return generated_ids, p_gens
