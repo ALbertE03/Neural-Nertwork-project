@@ -43,7 +43,7 @@ BIDIRECTIONAL = True
 IS_ATTENTION = True
 IS_PGEN = True
 IS_COVERAGE = True
-COV_LOSS_LAMBDA = 3.0 
+COV_LOSS_LAMBDA = 1.0 
 
 # =================================================
 # DECODING

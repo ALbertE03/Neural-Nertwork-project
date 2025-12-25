@@ -30,8 +30,8 @@ class Encoder(nn.Module):
         
         if pretrained_weights is not None:
             self.embedding.weight.data.copy_(pretrained_weights)
-            self.embedding.weight.requires_grad = True # Ahora son entrenables (Fine-tuning)
-            print("✓ Encoder: Pesos de embedding inicializados (Entrenables para Fine-tuning).")
+            self.embedding.weight.requires_grad = False 
+            print("✓ Encoder: Pesos de embedding inicializados (no Entrenables)")
         
         # LSTM bidireccional
         self.lstm = nn.LSTM(

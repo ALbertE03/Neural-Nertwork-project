@@ -22,6 +22,20 @@ class PGNDataset(Dataset):
         src_path = os.path.join(data_dir, f"{split}.txt.src")
         tgt_path = os.path.join(data_dir, f"{split}.txt.tgt")
         
+        # Verificar si existen versiones tokenizadas
+        src_tokenized_path = f"{split}.txt.src" + ".tokenized"
+        tgt_tokenized_path = f"{split}.txt.tgt" + ".tokenized"
+        
+        self.is_tokenized = False
+        
+        if os.path.exists(src_tokenized_path) and os.path.exists(tgt_tokenized_path):
+            print(f"✓ Usando archivos TOKENIZADOS para {split} (Carga optimizada en Kaggle)")
+            src_path = src_tokenized_path
+            tgt_path = tgt_tokenized_path
+            self.is_tokenized = True
+        else:
+            print(f"⚠ Usando archivos RAW para {split} (Tokenización en tiempo real -> LENTO)")
+
         if not os.path.exists(src_path) or not os.path.exists(tgt_path):
             raise FileNotFoundError(f"Split '{split}' no encontrado")
 
@@ -84,23 +98,41 @@ class PGNDataset(Dataset):
         tgt_line = self.tgt_lines[idx].strip()
         
         # --- 1. Head truncation por oraciones ---
+        
         raw_sentences = src_line.split(" . ")
+            
+        # --- 1. Head truncation por oraciones ---
+        if self.is_tokenized:
+            # Si ya está tokenizado, recuperamos las oraciones separando por "[.]"
+            # ya que preprocess_data.py las guardó así expresamente.
+            raw_sentences = src_line.split(" [.] ")
+        else:
+             # Usamos spaCy/NLTK para dividir oraciones (más lento pero robusto)
+             # Nota: Se usa NLTK según la última configuración aceptada
+             raw_sentences = nltk.sent_tokenize(src_line, language='spanish')
+             
         trimmed_src_tokens = []
         
         for sentence in raw_sentences:
-            sentence_tokens = self.vocab.process_text(sentence.strip())
-            if not sentence_tokens:
-                continue
-            
-            tokens_to_add = sentence_tokens + ['.']
+            if self.is_tokenized:
+                # Fast path: Ya está tokenizado por palabras
+                sentence_tokens = sentence.split()
+                # El split por " [.] " quitó el punto, lo añadimos para el modelo
+                tokens_to_add = sentence_tokens + ['.']
+            else:
+                # Slow path: Tokenización en tiempo real
+                sentence_tokens = self.vocab.process_text(sentence.strip())
+                if not sentence_tokens:
+                    continue
+                tokens_to_add = sentence_tokens
             
             if len(trimmed_src_tokens) + len(tokens_to_add) > self.MAX_LEN_SRC:
                 break
             
             trimmed_src_tokens.extend(tokens_to_add)
         
-        if trimmed_src_tokens and trimmed_src_tokens[-1] == '.':
-            trimmed_src_tokens = trimmed_src_tokens[:-1]
+        # Eliminar posible punto final si la última oración ya lo tenía y lo añadimos doble (opcional)
+        # O simplemente dejar la lógica fluir.
         
         # --- 2. Encoder con OOVs ---
         ext_src_ids, ext_vocab_size, oov_map, oov_words = \
@@ -109,7 +141,9 @@ class PGNDataset(Dataset):
         max_oov_len = ext_vocab_size - len(self.vocab.word_to_id)
         
         # Extended encoder input (con IDs extendidos para pointer-generator)
-        extended_encoder_input = self._pad_sequence(ext_src_ids.copy(), self.MAX_LEN_SRC)
+        # Dynamic Batching: NO rellenamos aquí, solo truncamos
+        # extended_encoder_input = self._pad_sequence(ext_src_ids.copy(), self.MAX_LEN_SRC)
+        extended_encoder_input = ext_src_ids[:self.MAX_LEN_SRC]
         
         # Encoder input regular (convertir OOVs a UNK para embeddings)
         encoder_input = [
@@ -118,7 +152,11 @@ class PGNDataset(Dataset):
         ]
         
         # --- 3. Decoder ---
-        tgt_tokens = self.vocab.process_text(tgt_line)
+        if self.is_tokenized:
+            tgt_tokens = tgt_line.strip().split()
+        else:
+            tgt_tokens = self.vocab.process_text(tgt_line)
+            
         tgt_ext_ids = self._map_target_to_extended_ids(tgt_tokens, oov_map)
         
         MAX_RAW_TGT_LEN = self.MAX_LEN_TGT - 1
@@ -135,12 +173,17 @@ class PGNDataset(Dataset):
         # Decoder target (mantener extended IDs para loss)
         decoder_output_ids = tgt_ext_ids + [self.EOS_ID]
         
-        decoder_input = self._pad_sequence(decoder_input_ids, self.MAX_LEN_TGT)
-        decoder_output = self._pad_sequence(decoder_output_ids, self.MAX_LEN_TGT)
+        # Dynamic Batching: NO rellenamos aquí
+        # decoder_input = self._pad_sequence(decoder_input_ids, self.MAX_LEN_TGT)
+        # decoder_output = self._pad_sequence(decoder_output_ids, self.MAX_LEN_TGT)
+        decoder_input = decoder_input_ids[:self.MAX_LEN_TGT]
+        decoder_output = decoder_output_ids[:self.MAX_LEN_TGT]
         
         # --- 4. Información adicional ---
         encoder_length = len(trimmed_src_tokens)
-        encoder_mask = [1] * encoder_length + [0] * (self.MAX_LEN_SRC - encoder_length)
+        # Mask será dinámica en collate, aquí solo devolvemos el largo real
+        # encoder_mask = [1] * encoder_length + [0] * (self.MAX_LEN_SRC - encoder_length)
+        encoder_mask = [1] * encoder_length
         
         return {
             "encoder_input": torch.tensor(encoder_input, dtype=torch.long),
@@ -150,7 +193,8 @@ class PGNDataset(Dataset):
             "decoder_input": torch.tensor(decoder_input, dtype=torch.long),
             "decoder_target": torch.tensor(decoder_output, dtype=torch.long),
             "max_oov_len": max_oov_len,
-            "oov_words": oov_words
+            "oov_words": oov_words,
+            "pad_id": self.PAD_ID  # Pasamos PAD_ID para el collate
         }
 
 def pgn_collate_fn(batch):
@@ -168,17 +212,31 @@ def pgn_collate_fn(batch):
     batch = filter_batch
     max_oov = max(x["max_oov_len"] for x in batch)
     
+    # 1. Obtener lengths máximos del batch actual (Dynamic Batching)
+    max_enc_len = max(x["encoder_length"].item() for x in batch)
+    max_dec_len = max(len(x["decoder_input"]) for x in batch)
+    
+    pad_id = batch[0]["pad_id"]
+    
+    def pad_tensor(t, length, val):
+        """Pad tensor to length with val"""
+        return torch.cat([t, torch.full((length - len(t),), val, dtype=t.dtype)])
+
     def pad_oov(words):
         """Rellenar lista de OOVs con strings vacíos"""
         return words + [""] * (max_oov - len(words))
     
     return {
-        "encoder_input": torch.stack([x["encoder_input"] for x in batch]),
-        "extended_encoder_input": torch.stack([x["extended_encoder_input"] for x in batch]),
+        # Encoders: Pad a max_enc_len
+        "encoder_input": torch.stack([pad_tensor(x["encoder_input"], max_enc_len, pad_id) for x in batch]),
+        "extended_encoder_input": torch.stack([pad_tensor(x["extended_encoder_input"], max_enc_len, pad_id) for x in batch]),
         "encoder_length": torch.stack([x["encoder_length"] for x in batch]),
-        "encoder_mask": torch.stack([x["encoder_mask"] for x in batch]),
-        "decoder_input": torch.stack([x["decoder_input"] for x in batch]),
-        "decoder_target": torch.stack([x["decoder_target"] for x in batch]),
+        "encoder_mask": torch.stack([pad_tensor(x["encoder_mask"], max_enc_len, 0) for x in batch]), # 0 es False/Pad
+        
+        # Decoders: Pad a max_dec_len
+        "decoder_input": torch.stack([pad_tensor(x["decoder_input"], max_dec_len, pad_id) for x in batch]),
+        "decoder_target": torch.stack([pad_tensor(x["decoder_target"], max_dec_len, pad_id) for x in batch]),
+        
         "max_oov_len": torch.tensor([x["max_oov_len"] for x in batch], dtype=torch.long),
         "oov_words": [pad_oov(x["oov_words"]) for x in batch]
     }

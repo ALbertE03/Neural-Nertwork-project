@@ -61,6 +61,9 @@ class Trainer:
         # Paths
         self.checkpoint_dir = config['checkpoint_dir']
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # AMP Scaler
+        self.scaler = torch.amp.GradScaler('cuda', enabled=config['use_gpu'])
     
     def train(self, train_loader, val_loader, num_epochs):
         """
@@ -144,15 +147,24 @@ class Trainer:
                 continue
             self.optimizer.zero_grad()
             
-            # Forward pass
-            outputs = self.model(batch, is_training=True)
-            loss = outputs['loss']
+            # Forward pass (con AMP)
+            with torch.amp.autocast('cuda', enabled=self.config['use_gpu']):
+                outputs = self.model(batch, is_training=True)
+                loss = outputs['loss']
             
-            # Backward pass
-            loss.backward()
+            # Backward pass (con Scaler)
+            self.scaler.scale(loss).backward()
             
-            # Optimizer step (con gradient clipping)
-            self.optimizer.step()
+            # Optimizer step (con gradient clipping y Scaler)
+            # Desescalar gradientes par clipping
+            self.scaler.unscale_(self.optimizer.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['grad_clip'])
+            
+            self.scaler.step(self.optimizer.optimizer)
+            self.scaler.update()
+            
+            # Actualizar contador de pasos del wrapper (ya que no llamamos a self.optimizer.step())
+            self.optimizer.current_step += 1
             
             # Tracking
             total_loss += loss.item()
@@ -420,7 +432,7 @@ def main():
         batch_size=config['train_batch_size'],
         shuffle=True,
         collate_fn=pgn_collate_fn,
-        num_workers=0,  # Ajustar según tu sistema
+        num_workers=2,  # Optimizado para Kaggle (2-4 suele ser ideal)
         pin_memory=True if USE_GPU else False
     )
     
@@ -429,7 +441,7 @@ def main():
         batch_size=config['eval_batch_size'],
         shuffle=False,
         collate_fn=pgn_collate_fn,
-        num_workers=0,
+        num_workers=2,
         pin_memory=True if USE_GPU else False
     )
     

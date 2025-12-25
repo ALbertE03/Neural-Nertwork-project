@@ -17,11 +17,15 @@ class Vocabulary:
         self.max_vocab_size = MAX_VOCAB_SIZE
         self._c = 0
         try:
-            self.nlp = spacy.load("es_core_news_sm", disable=['parser','ner'])
+            spacy.prefer_gpu()
+            self.nlp = spacy.load("es_core_news_sm", disable=['ner','lemmatizer','morphologizer','attribute_ruler'])
+            self.nlp.add_pipe('sentencizer')
         except OSError:
             print("Descargando modelo de spaCy español (Large)...")
+            spacy.prefer_gpu()
             spacy.cli.download("es_core_news_sm")
-            self.nlp = spacy.load("es_core_news_sm", disable=['parser','ner'])
+            self.nlp = spacy.load("es_core_news_sm", disable=['ner','lemmatizer','morphologizer','attribute_ruler'])
+            self.nlp.add_pipe('sentencizer')
         # Token de Relleno (Padding) - Usado para igualar longitudes de secuencias.
         self.pad_token = PAD_TOKEN
         # Token Desconocido (Unknown) - Usado para palabras no vistas en el vocabulario.
@@ -139,35 +143,36 @@ class Vocabulary:
         """Retorna el tamaño real de el vocabulario"""
         return self._c    
         
-    def _clean_text(self, text):
+    def _clean_text(self, text,for_vocab=False):
         """Limpieza inicial de texto antes de pasar por spaCy."""
         # 1. Quitar HTML
         text = re.sub(r'<[^>]+>', ' ', text)
         
-        # 2. Quitar URLs
-        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+        # Atrapa http, https, www y los que empiezan con //
+        url_pattern = r'(http[s]?://|www\.|//)[^\s/$.?#].[^\s]*'
         text = re.sub(url_pattern, ' ', text)
-
         # 3. Limpieza de caracteres especiales y ruido
         text = text.replace('\xa0', ' ')
         # Caracteres decorativos repetidos
         text = re.sub(r'[~*\-_=]{2,}', ' ', text)
-        # Elipses
+
+        if for_vocab:
+            # Quita números aislados: "1", "2025", "10.5", "50%"
+            # Y también combinaciones numéricas con guión: "1-0", "24-7", "2023-2024"
+            text = re.sub(r'\b\d+([.,-]\d+)*%?\b', ' ', text)
+        
         text = text.replace('...', ' ')
         
-        # 4. Normalizar espacios (Mantenemos fechas y números aquí)
+        # 4. Normalizar espacios 
         return re.sub(r'\s+', ' ', text).strip()
 
     def _tokens_from_doc(self, doc, for_vocab=False):
         """Extrae y filtra tokens de un doc de spaCy."""
         tokens = []
         for token in doc:
-            
-
             # Si estamos filtrando para el VOCABULARIO
             if for_vocab:
                 # Omitimos Números y Fechas en el vocabulario fijo
-                # (El PGN los manejará como OOVs y los copiará del texto original)
                 if token.like_num or token.pos_ == "NUM":
                     continue
                 # Intento de detectar fechas por forma básica
@@ -188,7 +193,7 @@ class Vocabulary:
 
     def process_text(self, text):
         """Procesa un único texto para el modelo (mantiene fechas/números)."""
-        text = self._clean_text(text)
+        text = self._clean_text(text,for_vocab=False)
         doc = self.nlp(text)
         return self._tokens_from_doc(doc, for_vocab=False)
 
@@ -240,6 +245,9 @@ class Vocabulary:
             raise
             
     def _create_vocabulary(self):
+        import multiprocessing
+        num_cores = max(1, multiprocessing.cpu_count() - 1)
+        print(f"Construyendo vocabulario usando {num_cores} núcleos...")
         print(f"Construyendo vocabulario a partir de los datos en: {self.data_dir}")
         src_files = [os.path.join(self.data_dir, f"{split}.txt.src") for split in ["train"]]
         tgt_files = [os.path.join(self.data_dir, f"{split}.txt.tgt") for split in ["train"]]
@@ -249,17 +257,19 @@ class Vocabulary:
         word_counts = Counter()
        
         for file_path in all_files:
-            with open(file_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
             
-            # Limpieza inicial en paralelo (str processing)
-            cleaned_lines = [self._clean_text(line) for line in lines]
-            
-            # Procesamiento por batches con spaCy
-            for doc in tqdm(self.nlp.pipe(cleaned_lines, batch_size=500), 
-                           total=len(cleaned_lines), 
-                           desc=f"Procesando {os.path.basename(file_path)}"):
-                # Para el vocabulario usamos for_vocab=True para filtrar números/fechas
+            def line_generator(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        # Aplicamos la limpieza básica de strings antes de spaCy
+                        yield self._clean_text(line, for_vocab=True)
+                        
+            doc_stream = self.nlp.pipe(
+                line_generator(file_path), 
+                batch_size=1000, 
+                n_process=num_cores
+            )
+            for doc in tqdm(doc_stream, desc=f"Procesando {os.path.basename(file_path)}"):
                 tokens = self._tokens_from_doc(doc, for_vocab=True)
                 word_counts.update(tokens)
       
