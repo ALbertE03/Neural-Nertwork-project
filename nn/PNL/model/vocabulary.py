@@ -3,7 +3,7 @@ from collections import Counter
 import json
 import re
 import spacy
-
+from tqdm import tqdm
 class Vocabulary:
     def __init__(self, CREATE_VOCABULARY,
                  PAD_TOKEN, UNK_TOKEN,

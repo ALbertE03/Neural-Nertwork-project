@@ -1,119 +1,110 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 
 class ConvLSTMCell(nn.Module):
-    def __init__(self, input_dim, hidden_dim, kernel_size, bias):
-        super(ConvLSTMCell, self).__init__()
+    """Celda ConvLSTM con BatchNorm"""
+    def __init__(self, input_channels, hidden_channels, kernel_size=3, use_bn=True):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.use_bn = use_bn
+        padding = kernel_size // 2
         
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        
-        self.kernel_size = kernel_size
-        self.padding = kernel_size[0] // 2, kernel_size[1] // 2
-        self.bias = bias
-        
-        self.conv = nn.Conv2d(in_channels=self.input_dim + self.hidden_dim, 
-                              out_channels=4 * self.hidden_dim, 
-                              kernel_size=self.kernel_size, 
-                              padding=self.padding, 
-                              bias=self.bias)
-        
-    def forward(self, input_tensor, cur_state):
-        h_cur, c_cur = cur_state
-        
-        combined = torch.cat([input_tensor, h_cur], dim=1)  # concatenate along channel axis
-        
-        combined_conv = self.conv(combined)
-        cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1) 
-        
-        i = torch.sigmoid(cc_i)
-        f = torch.sigmoid(cc_f)
-        o = torch.sigmoid(cc_o)
-        g = torch.tanh(cc_g)
-        
-        c_next = f * c_cur + i * g
-        h_next = o * torch.tanh(c_next)
-        
-        return h_next, c_next
-
-    def init_hidden(self, batch_size, image_size):
-        height, width = image_size
-        return (torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device),
-                torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device))
-
-
-class FireSpreadModel(nn.Module):
-    """
-    Encoder-Decoder Architecture with ConvLSTM for Spatio-Temporal Prediction.
-    """
-    def __init__(self, config):
-        super(FireSpreadModel, self).__init__()
-        
-        self.hidden_channels = config.hidden_channels
-        self.kernel_size = config.kernel_size
-        input_channels = config.input_channels
-        
-        # --- Encoder ---
-        # Extracts spatial features from each frame independently
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
+        # Gates: input, forget, cell, output (4x hidden)
+        self.conv = nn.Conv2d(
+            input_channels + hidden_channels, 
+            4 * hidden_channels,
+            kernel_size=kernel_size,
+            padding=padding
         )
         
-        # --- Temporal Bottleneck ---
-        # ConvLSTM processes the sequence of features
-        self.conv_lstm = ConvLSTMCell(input_dim=64, 
-                                      hidden_dim=self.hidden_channels, 
-                                      kernel_size=self.kernel_size, 
-                                      bias=True)
+        if use_bn:
+            self.bn = nn.BatchNorm2d(4 * hidden_channels)
+    
+    def forward(self, x, state):
+        h, c = state
+        combined = torch.cat([x, h], dim=1)
+        gates = self.conv(combined)
         
-        # --- Decoder ---
-        # Reconstructs the next step prediction from the last hidden state
+        if self.use_bn:
+            gates = self.bn(gates)
+        
+        i, f, g, o = torch.chunk(gates, 4, dim=1)
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        g = torch.tanh(g)
+        o = torch.sigmoid(o)
+        
+        c_new = f * c + i * g
+        h_new = o * torch.tanh(c_new)
+        
+        return h_new, c_new
+    
+    def init_hidden(self, batch_size, height, width, device):
+        return (
+            torch.zeros(batch_size, self.hidden_channels, height, width, device=device),
+            torch.zeros(batch_size, self.hidden_channels, height, width, device=device)
+        )
+
+
+class FirePredictModel(nn.Module):
+    """
+    Modelo ConvLSTM para predecir incendios 2 días en el futuro.
+    Con BatchNorm y Dropout para mejor generalización.
+    
+    Input: Secuencia temporal (B, T, C, H, W)
+    Output: 2 máscaras futuras (B, 2, H, W) → día+1 y día+2
+    """
+    def __init__(self, input_channels=10, hidden_channels=32, pred_horizon=2, dropout=0.3):
+        super().__init__()
+        self.pred_horizon = pred_horizon
+        self.hidden_channels = hidden_channels
+        
+        # Encoder: 2 capas ConvLSTM
+        self.encoder1 = ConvLSTMCell(input_channels, hidden_channels, use_bn=True)
+        self.encoder2 = ConvLSTMCell(hidden_channels, hidden_channels, use_bn=True)
+        
+        self.dropout = nn.Dropout2d(dropout)
+        
+        # Decoder con BatchNorm
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(self.hidden_channels, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, kernel_size=3, padding=1) # Output: 1 channel (Fire/No Fire logits)
+            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(hidden_channels, hidden_channels // 2, 3, padding=1),
+            nn.BatchNorm2d(hidden_channels // 2),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels // 2, pred_horizon, 1),  # 2 canales = 2 días
+            nn.Sigmoid()  # Probabilidad de fuego [0, 1]
         )
-        
-    def forward(self, x, future_steps=1):
+    
+    def forward(self, x):
         """
-        x: (Batch, Time, Channels, Height, Width)
-        future_steps: Number of future steps to predict (autoregressive)
+        Args:
+            x: (B, T, C, H, W) - secuencia temporal
+        Returns:
+            pred: (B, 2, H, W) - predicción día+1 y día+2
         """
-        b, t, c, h, w = x.size()
+        B, T, C, H, W = x.shape
+        device = x.device
         
-        # Initialize hidden state
-        h_t, c_t = self.conv_lstm.init_hidden(b, (h, w))
+        # Inicializar hidden states
+        state1 = self.encoder1.init_hidden(B, H, W, device)
+        state2 = self.encoder2.init_hidden(B, H, W, device)
         
-        # Process input sequence
-        for t_step in range(t):
-            # Extract features for current frame
-            # (Batch, Channels, H, W)
-            frame = x[:, t_step, :, :, :] 
-            features = self.encoder(frame)
+        # Procesar secuencia completa
+        for t in range(T):
+            h1, c1 = self.encoder1(x[:, t], state1)
+            h1 = self.dropout(h1)
+            state1 = (h1, c1)
             
-            # Update LSTM state
-            h_t, c_t = self.conv_lstm(features, (h_t, c_t))
-            
-        # Predict future steps
-        outputs = []
-        last_h = h_t
+            h2, c2 = self.encoder2(h1, state2)
+            h2 = self.dropout(h2)
+            state2 = (h2, c2)
         
-        for _ in range(future_steps):
-            # Decode the hidden state to get prediction
-            pred = self.decoder(last_h) # (Batch, 1, H, W)
-            outputs.append(pred)
-            
-            # Autoregressive inference not fully implemented for training stability 
-            # (Teacher forcing it s better, but here we just return the next step predictions based on history)
-            # Improving this would require feeding the output back as input.
-            
-        # Stack outputs along time dimension
-        outputs = torch.stack(outputs, dim=1) # (Batch, Future_Steps, 1, H, W)
+        # Decodificar a 2 predicciones futuras
+        pred = self.decoder(h2)  # (B, 2, H, W)
         
-        return outputs
+        return pred

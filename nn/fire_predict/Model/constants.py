@@ -1,20 +1,18 @@
 # Default Paths
-DEFAULT_DATA_X_PATH = './data_x.npy'
-DEFAULT_DATA_Y_PATH = './data_y.npy'
-CHECKPOINT_DIR = './checkpoints'
+DATA_PATHS = [] 
 
 # Data Dimensions
-IMG_HEIGHT = 64
-IMG_WIDTH = 64
-INPUT_CHANNELS = 12 # 12 spectral bands
+SHAPES = (256,256)
+INPUT_CHANNELS = 28 
 
 # Model Architecture Defaults
-HIDDEN_CHANNELS = 64
-KERNEL_SIZE = (3, 3)
+HIDDEN_CHANNELS = 32
+DROPOUT = 0.3
 
 # Training Hyperparameters
-BATCH_SIZE = 16
+BATCH_SIZE = 2
 LEARNING_RATE = 1e-4
-EPOCHS = 50
-INPUT_SEQ_LEN = 5  # Past frames
-PRED_SEQ_LEN = 1   # Future frames to predict
+EPOCHS = 100
+PRED_SEQ_LEN = 2  
+ACCUM_STEPS = 4    
+

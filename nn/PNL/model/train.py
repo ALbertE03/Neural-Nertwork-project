@@ -163,7 +163,6 @@ class Trainer:
             self.scaler.step(self.optimizer.optimizer)
             self.scaler.update()
             
-            # Actualizar contador de pasos del wrapper (ya que no llamamos a self.optimizer.step())
             self.optimizer.current_step += 1
             
             # Tracking

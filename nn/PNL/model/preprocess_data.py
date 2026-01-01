@@ -5,45 +5,89 @@ import multiprocessing
 
 # Añadir path para importar modulos del proyecto
 sys.path.append(os.path.join(os.getcwd(), 'nn/PNL/model'))
-
+import re
 from vocabulary import Vocabulary
-from constant import *
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
-def preprocess_files(vocab, files, is_source=True):
+def _clean_text( text,for_vocab=False):
+        """Limpieza inicial de texto antes de pasar por spaCy."""
+        # 1. Quitar HTML
+        text = re.sub(r'<[^>]+>', ' ', text)
+        
+        # Atrapa http, https, www y los que empiezan con //
+        url_pattern = r'(http[s]?://|www\.|//)[^\s/$.?#].[^\s]*'
+        text = re.sub(url_pattern, ' ', text)
+        # 3. Limpieza de caracteres especiales y ruido
+        text = text.replace('\xa0', ' ')
+        # Caracteres decorativos repetidos
+        text = re.sub(r'[~*\-_=]{2,}', ' ', text)
+
+        if for_vocab:
+            # Quita números aislados: "1", "2025", "10.5", "50%"
+            # Y también combinaciones numéricas con guión: "1-0", "24-7", "2023-2024"
+            text = re.sub(r'\b\d+([.,-]\d+)*%?\b', ' ', text)
+        
+        text = text.replace('...', ' ')
+        
+        # 4. Normalizar espacios 
+        return re.sub(r'\s+', ' ', text).strip()
+def _tokens_from_doc(doc, for_vocab=False):
+        """Extrae y filtra tokens de un doc de spaCy."""
+        tokens = []
+        for token in doc:
+            # Si estamos filtrando para el VOCABULARIO
+            if for_vocab:
+                # Omitimos Números y Fechas en el vocabulario fijo
+                if token.like_num or token.pos_ == "NUM":
+                    continue
+                # Intento de detectar fechas por forma básica
+                if re.match(r'\d+[/-]\d+', token.text):
+                    continue
+            
+            # Filtros comunes (Puntuación ruidosa, brackets, quotes)
+            if token.is_punct and token.text not in ['.', ',', '!', '?','¿']:
+                continue
+            if token.is_bracket or token.is_quote:
+                continue
+            t = token.text
+            t = t.replace('``', '"').replace("''", '"')
+            if t:
+                tokens.append(t)
+        return tokens
+def preprocess_files(files, is_source=True):
     """
     Preprocesa una lista de archivos y guarda el resultado en .tokenized
     """
-    # Determinar número de núcleos
-    num_cores = max(1, multiprocessing.cpu_count() - 1)
-    
+    import spacy
+    num_cores = 3
+    nlp = spacy.load("es_core_news_sm", disable=['ner','lemmatizer','morphologizer','attribute_ruler'])
+    nlp.add_pipe('sentencizer')
     for file_path, original_name in files:
         output_path = original_name + ".tokenized"
-        # Si no es un path absoluto, le ponemos el DATA_DIR
         if not os.path.isabs(output_path):
             output_path = os.path.join(DATA_DIR, output_path)
             
         print(f"Procesando {os.path.basename(file_path)} -> {os.path.basename(output_path)}")
         
-        # 1. Definir generador de líneas
         def line_generator(path):
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
-                    yield vocab._clean_text(line, for_vocab=False)
+                    yield _clean_text(line, for_vocab=False)
         
-        # 2. Pipeline de spaCy
-        doc_stream = vocab.nlp.pipe(
+
+        doc_stream = nlp.pipe(
             line_generator(file_path), 
-            batch_size=500, 
+            batch_size=200, 
             n_process=num_cores
         )
-        
-        # 3. Guardar resultados
+
         with open(output_path, "w", encoding="utf-8") as f_out:
-            for doc in tqdm(doc_stream, desc=f"  Tokenizando..."):
+            for doc in tqdm(doc_stream):
                 # Procesamos por oraciones para mantener la estructura
                 sentences_tokens = []
                 for sent in doc.sents:
-                    tokens = vocab._tokens_from_doc(sent, for_vocab=False)
+                    tokens = _tokens_from_doc(sent, for_vocab=False)
                     if tokens:
                         sentences_tokens.append(" ".join(tokens))
                 
@@ -53,19 +97,6 @@ def preprocess_files(vocab, files, is_source=True):
 def main():
     print("=== INICIANDO PREPROCESAMIENTO ===")
     
-    # 1. Cargar Vocabulario
-    print("Cargando instancia de Vocabulary...")
-    vocab = Vocabulary(
-        CREATE_VOCABULARY=False,
-        PAD_TOKEN=PAD_TOKEN,
-        UNK_TOKEN=UNK_TOKEN,
-        START_DECODING=START_DECODING,
-        END_DECODING=END_DECODING,
-        MAX_VOCAB_SIZE=MAX_VOCAB_SIZE,
-        CHECKPOINT_VOCABULARY_DIR=CHECKPOINT_VOCABULARY_DIR,
-        DATA_DIR=DATA_DIR,
-        VOCAB_NAME=VOCAB_NAME
-    )
 
     # 2. Definir archivos
     splits = ['train', 'val', 'test']
@@ -86,11 +117,11 @@ def main():
     # 3. Procesar
     if src_files:
         print(f"\nArchivos Source encontrados: {len(src_files)}")
-        preprocess_files(vocab, src_files, is_source=True)
+        preprocess_files(src_files, is_source=True)
     
     if tgt_files:
         print(f"\nArchivos Target encontrados: {len(tgt_files)}")
-        preprocess_files(vocab, tgt_files, is_source=False)
+        preprocess_files(tgt_files, is_source=False)
     
     print("\n=== PREPROCESAMIENTO COMPLETADO ===")
 

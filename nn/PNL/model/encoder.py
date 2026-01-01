@@ -24,7 +24,7 @@ class Encoder(nn.Module):
         self.hidden_size = hidden_size
         self.num_enc_layers = num_enc_layers
         self.bidirectional = bidirectional
-        
+        self.dropout = nn.Dropout(dropout_ratio)
         # Embedding layer (solo para vocabulario base)
         self.embedding = nn.Embedding(vocab_size, embedding_size, padding_idx=0)
         
@@ -62,7 +62,7 @@ class Encoder(nn.Module):
         
         # 1. Embeddings
         embedded = self.embedding(encoder_input)  # (batch_size, src_len, embedding_size)
-        
+        embedded = self.dropout(embedded)
         # 2. Pack padded sequence para eficiencia
         packed = nn.utils.rnn.pack_padded_sequence(
             embedded, 

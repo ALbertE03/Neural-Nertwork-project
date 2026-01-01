@@ -1,61 +1,46 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-class DiceLoss(nn.Module):
-    def __init__(self, smooth=1.0):
-        super(DiceLoss, self).__init__()
-        self.smooth = smooth
 
-    def forward(self, inputs, targets):
-        # inputs: (Batch, 1, H, W) - Logits from model
-        # targets: (Batch, 1, H, W) - Binary masks (0, 1)
-        
-        # Apply sigmoid to convert logits to probabilities
-        inputs = torch.sigmoid(inputs)
-        
-        # Flatten label and prediction tensors
-        inputs = inputs.view(-1)
-        targets = targets.view(-1)
-        
-        intersection = (inputs * targets).sum()                            
-        dice = (2.*intersection + self.smooth)/(inputs.sum() + targets.sum() + self.smooth)  
-        
-        return 1 - dice
-
-class BCEDiceLoss(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(BCEDiceLoss, self).__init__()
-        self.bce = nn.BCEWithLogitsLoss(weight=weight, size_average=size_average)
-        self.dice = DiceLoss()
-
-    def forward(self, inputs, targets):
-        # inputs: Logits
-        # targets: Binary Mask
-        bce_loss = self.bce(inputs, targets)
-        dice_loss = self.dice(inputs, targets)
-        
-        return bce_loss + dice_loss
-
-def calculate_iou(preds, labels, threshold=0.5):
+def dice_loss(pred, target, mask=None, smooth=1.0):
     """
-    Calculate Intersection over Union (IoU) for a batch of predictions.
-    preds: Logits or Probabilities (Batch, 1, H, W)
-    labels: Binary Mask (Batch, 1, H, W)
+    Dice loss con soporte para máscara de validez.
+    
+    Args:
+        pred: (B, ...) - probabilidades [0, 1]
+        target: (B, ...) - binary mask
+        mask: (B, ...) - 1 donde hay datos válidos, 0 donde ignorar
     """
-    # Convert logits to binary predictions
-    preds = torch.sigmoid(preds)
-    preds = (preds > threshold).float()
+    if mask is None:
+        mask = torch.ones_like(pred)
     
-    # Flatten
-    preds = preds.view(-1)
-    labels = labels.view(-1)
+    pred_flat = (pred * mask).view(-1)
+    target_flat = (target * mask).view(-1)
     
-    intersection = (preds * labels).sum()
-    union = preds.sum() + labels.sum() - intersection
+    intersection = (pred_flat * target_flat).sum()
+    dice = (2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
+    
+    return 1 - dice
+
+
+def iou_score(pred, target, mask=None, threshold=0.5):
+    """
+    IoU score con soporte para máscara.
+    
+    Args:
+        pred: probabilidades [0, 1]
+        target: binary mask
+        mask: máscara de validez
+    """
+    if mask is None:
+        mask = torch.ones_like(pred)
+    
+    pred_bin = ((pred > threshold).float() * mask).view(-1)
+    target_flat = (target * mask).view(-1)
+    
+    intersection = (pred_bin * target_flat).sum()
+    union = pred_bin.sum() + target_flat.sum() - intersection
     
     if union == 0:
-        return 1.0 # Perfect match (both empty)
-        
-    iou = intersection / union
-    return iou.item()
+        return 1.0
+    
+    return (intersection / union).item()

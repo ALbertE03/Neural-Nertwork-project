@@ -39,7 +39,7 @@ class Decoder(nn.Module):
         
         # Embedding layer (solo para vocabulario base)
         self.embedding = nn.Embedding(vocab_size, embedding_size, padding_idx=0)
-        
+        self.dropout = nn.Dropout(dropout_ratio)
         # LSTM decoder
         # Input: embedding + context vector (si hay atención)
         lstm_input_size = embedding_size + (hidden_size * 2 if is_attention else 0)
@@ -51,7 +51,9 @@ class Decoder(nn.Module):
             batch_first=True,
             dropout=dropout_ratio if num_dec_layers > 1 else 0
         )
-        
+         # Normalización por capas para embeddings y salidas del LSTM
+        self.emb_ln = nn.LayerNorm(embedding_size)
+        self.lstm_out_ln = nn.LayerNorm(hidden_size)
         # Attention mechanism
         if is_attention:
             self.attention = Attention(hidden_size, is_coverage=is_coverage)
@@ -93,6 +95,7 @@ class Decoder(nn.Module):
         
         # 1. Embeddings del input
         embedded = self.embedding(decoder_input)  # (batch_size, embedding_size)
+        embedded = self.dropout(embedded)
         embedded = embedded.unsqueeze(1)  # (batch_size, 1, embedding_size)
         
         # 2. Concatenar con context vector si hay atención
@@ -142,7 +145,7 @@ class Decoder(nn.Module):
             
             # Crear distribución extendida
             src_len = extended_encoder_input.size(1)
-            extended_vocab_size = self.vocab_size + src_len  # Aproximación conservadora
+            extended_vocab_size = self.vocab_size + src_len 
             
             # Inicializar distribución extendida
             final_dist = torch.zeros(batch_size, extended_vocab_size, device=vocab_dist.device)

@@ -2,6 +2,7 @@ import os
 from typing import List, Tuple, Dict
 import torch
 from torch.utils.data import Dataset
+
 class PGNDataset(Dataset):
     """
     Dataset para PGN con OOVs dinámicos y head truncation
@@ -104,12 +105,7 @@ class PGNDataset(Dataset):
         # --- 1. Head truncation por oraciones ---
         if self.is_tokenized:
             # Si ya está tokenizado, recuperamos las oraciones separando por "[.]"
-            # ya que preprocess_data.py las guardó así expresamente.
             raw_sentences = src_line.split(" [.] ")
-        else:
-             # Usamos spaCy/NLTK para dividir oraciones (más lento pero robusto)
-             # Nota: Se usa NLTK según la última configuración aceptada
-             raw_sentences = nltk.sent_tokenize(src_line, language='spanish')
              
         trimmed_src_tokens = []
         
@@ -117,22 +113,12 @@ class PGNDataset(Dataset):
             if self.is_tokenized:
                 # Fast path: Ya está tokenizado por palabras
                 sentence_tokens = sentence.split()
-                # El split por " [.] " quitó el punto, lo añadimos para el modelo
-                tokens_to_add = sentence_tokens + ['.']
-            else:
-                # Slow path: Tokenización en tiempo real
-                sentence_tokens = self.vocab.process_text(sentence.strip())
-                if not sentence_tokens:
-                    continue
                 tokens_to_add = sentence_tokens
             
             if len(trimmed_src_tokens) + len(tokens_to_add) > self.MAX_LEN_SRC:
                 break
             
             trimmed_src_tokens.extend(tokens_to_add)
-        
-        # Eliminar posible punto final si la última oración ya lo tenía y lo añadimos doble (opcional)
-        # O simplemente dejar la lógica fluir.
         
         # --- 2. Encoder con OOVs ---
         ext_src_ids, ext_vocab_size, oov_map, oov_words = \
@@ -141,7 +127,7 @@ class PGNDataset(Dataset):
         max_oov_len = ext_vocab_size - len(self.vocab.word_to_id)
         
         # Extended encoder input (con IDs extendidos para pointer-generator)
-        # Dynamic Batching: NO rellenamos aquí, solo truncamos
+        # Dynamic Batching
         # extended_encoder_input = self._pad_sequence(ext_src_ids.copy(), self.MAX_LEN_SRC)
         extended_encoder_input = ext_src_ids[:self.MAX_LEN_SRC]
         
@@ -153,10 +139,11 @@ class PGNDataset(Dataset):
         
         # --- 3. Decoder ---
         if self.is_tokenized:
-            tgt_tokens = tgt_line.strip().split()
+            tgt_tokens = tgt_line.strip().split(' [.]')
+        
         else:
-            tgt_tokens = self.vocab.process_text(tgt_line)
-            
+            raise "tokeniza primero el dataset con preprocess_data.py"
+        
         tgt_ext_ids = self._map_target_to_extended_ids(tgt_tokens, oov_map)
         
         MAX_RAW_TGT_LEN = self.MAX_LEN_TGT - 1
@@ -173,7 +160,7 @@ class PGNDataset(Dataset):
         # Decoder target (mantener extended IDs para loss)
         decoder_output_ids = tgt_ext_ids + [self.EOS_ID]
         
-        # Dynamic Batching: NO rellenamos aquí
+        # Dynamic Batching
         # decoder_input = self._pad_sequence(decoder_input_ids, self.MAX_LEN_TGT)
         # decoder_output = self._pad_sequence(decoder_output_ids, self.MAX_LEN_TGT)
         decoder_input = decoder_input_ids[:self.MAX_LEN_TGT]
@@ -194,7 +181,7 @@ class PGNDataset(Dataset):
             "decoder_target": torch.tensor(decoder_output, dtype=torch.long),
             "max_oov_len": max_oov_len,
             "oov_words": oov_words,
-            "pad_id": self.PAD_ID  # Pasamos PAD_ID para el collate
+            "pad_id": self.PAD_ID  
         }
 
 def pgn_collate_fn(batch):

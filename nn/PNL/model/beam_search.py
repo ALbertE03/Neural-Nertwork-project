@@ -165,8 +165,8 @@ class BeamSearch:
                 log_probs = torch.log(final_dist + 1e-12)  # (1, extended_vocab_size)
                 log_probs = log_probs.squeeze(0)  # (extended_vocab_size,)
                 
-                # Penalizar UNK si queremos
-                # log_probs[self.unk_id] -= 100.0
+                # Penalizar UNK 
+                log_probs[self.unk_id] -= 100.0
                 
                 # Penalizar END si estamos antes de min_len
                 if step < self.min_len:
