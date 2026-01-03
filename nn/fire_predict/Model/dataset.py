@@ -86,6 +86,48 @@ class TSDataset(Dataset):
         )
         return dst_img, new_transform
 
+    
+    def _normalize_data(self, data, is_label=False):
+        """
+        Normaliza los datos a rangos seguros [0, 1].
+        Maneja NaNs, valores negativos de error y outliers.
+        """
+        # 1. Limpieza básica de NaNs
+        data = np.nan_to_num(data, nan=0.0)
+        
+        if is_label:
+            # Etiquetas: [0, 1] estricto
+            # Eliminar valores negativos (NoData)
+            data[data < 0] = 0.0
+            # Clip a 1.0 (maneja valores 255 o acumulados)
+            data = np.clip(data, 0.0, 1.0)
+        else:
+            # Inputs: Limpiar basura negativa (ej. -9999)
+            data[data < -100] = 0.0
+            
+            # Normalización Min-Max por canal para estabilizar entrenamiento
+            # Si el array es 3D (C, H, W)
+            if data.ndim == 3:
+                for c in range(data.shape[0]):
+                    channel = data[c]
+                    min_val, max_val = channel.min(), channel.max()
+                    # Solo normalizar si hay rango dinámico
+                    if max_val - min_val > 1e-5:
+                        data[c] = (channel - min_val) / (max_val - min_val)
+                    else:
+                        # Si es constante y grande, bajarlo a 1.0
+                        if max_val > 1.0:
+                            data[c] = 1.0
+            # Si es 2D (H, W)
+            elif data.ndim == 2:
+                min_val, max_val = data.min(), data.max()
+                if max_val - min_val > 1e-5:
+                    data = (data - min_val) / (max_val - min_val)
+                elif max_val > 1.0:
+                    data[:] = 1.0
+                    
+        return data
+
     def _preprocess(self, imgs, transforms, crss, is_day=False, is_night=False, is_fireP=False, target_shape=(256, 256)):
         H_new, W_new = target_shape
         news_imgs = []
@@ -108,8 +150,9 @@ class TSDataset(Dataset):
                 
                 # Crear máscara de validez basada en NaNs originales
                 raw_mask = (~np.isnan(raw_fire)).astype(np.float32)
-                # Limpiar NaNs en el fuego
-                raw_fire = np.nan_to_num(raw_fire, nan=0.0)
+                
+                # Normalizar Label (raw_fire) ANTES de resize para que el average funcione bien sobre 0-1
+                raw_fire = self._normalize_data(raw_fire, is_label=True)
                 
                 # Calcular área original
                 orig_pixel_area = abs(src_transform.a * src_transform.e)
@@ -150,8 +193,8 @@ class TSDataset(Dataset):
                 # Máscara de datos (input)
                 mask = (~np.isnan(img_resized)).astype(np.float32)
                 
-                # Reemplazar NaN en datos
-                img_resized = np.nan_to_num(img_resized, nan=0.0)
+                # Normalizar DATOS (Inputs)
+                img_resized = self._normalize_data(img_resized, is_label=False)
                 
                 news_imgs.append(img_resized)
                 masks.append(mask)
@@ -175,11 +218,9 @@ class TSDataset(Dataset):
                 # Máscara
                 mask = (~np.isnan(img_resized)).astype(np.float32)
                 
-                # Reemplazar NaN según tipo
-                if is_fireP:
-                    img_resized = np.nan_to_num(img_resized, nan=200.0)
-                else:
-                    img_resized = np.nan_to_num(img_resized, nan=0.0)
+                # Normalizar DATOS (Inputs)
+                # Si es fireP, quizás queramos tratarlo diferente, pero por ahora normalizamos todo
+                img_resized = self._normalize_data(img_resized, is_label=False)
                 
                 # Para night, si tiene 5 canales, tomar solo los últimos 2
                 if is_night and img_resized.shape[0] == 5:

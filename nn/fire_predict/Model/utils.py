@@ -172,8 +172,11 @@ def centroid_distance_error(pred, target, pixel_area, mask=None, threshold=0.5):
     pixel_side = torch.sqrt(pixel_area) # (B, T)
     dist_meters = dist_px * pixel_side
     
-    # Retornar promedio solo de muestras válidas
-    return dist_meters[valid_mask].mean().item()
+    # Retornar suma de errores y cantidad de muestras válidas para promediar correctamente fuera
+    if valid_mask.any():
+        return dist_meters[valid_mask].sum().item(), valid_mask.sum().item()
+    else:
+        return 0.0, 0
 
 def physical_area_consistency(mask_proj, pixel_area_proj, area_orig, threshold=0.5):
     """
@@ -193,12 +196,19 @@ def physical_area_consistency(mask_proj, pixel_area_proj, area_orig, threshold=0
     # Diferencia (Proj - Orig). 
     diff_area = area_proj - area_orig
     
-    # Error relativo
-    rel_error = torch.abs(diff_area) / (area_orig + 1e-8)
+    # Error relativo: Solo calcular donde hay fuego real para evitar división por cero/epsilon
+    # Si area_orig es 0, el error relativo no tiene sentido (o es infinito).
+    mask_valid = area_orig > 1e-4
+    
+    if mask_valid.any():
+        rel_error = torch.abs(diff_area[mask_valid]) / (area_orig[mask_valid])
+        rel_error_mean = rel_error.mean().item()
+    else:
+        rel_error_mean = 0.0
     
     return {
         'diff_mean': diff_area.mean().item(),
-        'rel_error': rel_error.mean().item(),
+        'rel_error': rel_error_mean,
         'area_orig': area_orig.mean().item(),
         'area_proj': area_proj.mean().item()
     }

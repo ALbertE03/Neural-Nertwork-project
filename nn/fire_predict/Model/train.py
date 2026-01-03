@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from pathlib import Path
 import os
+import json
 from tqdm import tqdm
 from constants import *
 from model import FirePredictModel
@@ -56,8 +57,12 @@ def train_epoch(model, loader, optimizer, scaler, device, pred_horizon=2, accum_
             scaler.update()
             optimizer.zero_grad()
         
-        total_loss += loss.item() * accum_steps * B
+        current_loss = loss.item() * accum_steps
+        total_loss += current_loss * B
         total_samples += B
+        
+        # Actualizar barra de progreso con el loss actual
+        pbar.set_postfix({'loss': f'{current_loss:.4f}'})
     
     # Actualizar con gradientes restantes
     if (batch_idx + 1) % accum_steps != 0:
@@ -78,6 +83,7 @@ def validate(model, loader, device, pred_horizon=2):
     total_recall = 0
     total_area_error = 0
     total_centroid_error = 0
+    total_centroid_samples = 0
     total_phys_diff = 0
     total_phys_rel_err = 0
     total_cluster_diff = 0
@@ -131,13 +137,14 @@ def validate(model, loader, device, pred_horizon=2):
         total_area_error += area_err * B
 
         # Centroid Error
-        centroid_err = centroid_distance_error(
+        centroid_err_sum, centroid_count = centroid_distance_error(
             pred_probs.unsqueeze(1),
             target.unsqueeze(1),
             target_area.unsqueeze(1),
             target_mask.unsqueeze(1)
         )
-        total_centroid_error += centroid_err * B
+        total_centroid_error += centroid_err_sum
+        total_centroid_samples += centroid_count
         
         # Physical Area Consistency
         phys_metrics = physical_area_consistency(
@@ -166,7 +173,7 @@ def validate(model, loader, device, pred_horizon=2):
         total_precision / max(total_samples, 1),
         total_recall / max(total_samples, 1),
         total_area_error / max(total_samples, 1),
-        total_centroid_error / max(total_samples, 1),
+        total_centroid_error / max(total_centroid_samples, 1),
         total_phys_diff / max(total_samples, 1),
         total_phys_rel_err / max(total_samples, 1),
         total_cluster_diff / max(total_samples, 1)
@@ -219,6 +226,13 @@ def main():
     
     scaler = torch.amp.GradScaler(enabled=(device.type != 'cpu'))
     
+    # Cargar o inicializar historial
+    history_file = 'train_history.json'
+    if os.path.exists(history_file) and start_epoch > 0:
+        with open(history_file, 'r') as f:
+            history = json.load(f)
+    else:
+        history = []
     
     for epoch in range(start_epoch, EPOCHS):
         print(f"Epoch {epoch+1}/{EPOCHS}")
@@ -227,7 +241,25 @@ def main():
         
         scheduler.step(val_iou)
         
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {train_loss:.4f} | Val IoU: {val_iou:.4f} | F1: {val_f1:.4f} | Prec: {val_prec:.4f} | Rec: {val_rec:.4f} | Area Err: {val_area_err:.2f} | Centroid Err: {val_centroid_err:.2f}m | Phys Diff: {val_phys_diff:.2f}m2 | Phys Rel Err: {val_phys_rel:.4f} | Cluster Diff: {val_cluster_diff:.2f}")
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {train_loss:.4f} | Val IoU: {val_iou:.4f} | F1: {val_f1:.4f} | Prec: {val_prec:.4f} | Rec: {val_rec:.4f} | Area Err: {val_area_err:.2e} | Centroid Err: {val_centroid_err:.2f}m | Phys Diff: {val_phys_diff:.2e} | Phys Rel Err: {val_phys_rel:.2e} | Cluster Diff: {val_cluster_diff:.2f}")
+        
+        # Guardar métricas en historial
+        epoch_metrics = {
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'val_iou': val_iou,
+            'val_f1': val_f1,
+            'val_precision': val_prec,
+            'val_recall': val_rec,
+            'val_area_error': val_area_err,
+            'val_centroid_error': val_centroid_err,
+            'val_phys_diff': val_phys_diff,
+            'val_phys_rel_err': val_phys_rel,
+            'val_cluster_diff': val_cluster_diff
+        }
+        history.append(epoch_metrics)
+        with open(history_file, 'w') as f:
+            json.dump(history, f, indent=4)
         
         if val_iou > best_iou:
             best_iou = val_iou
