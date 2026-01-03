@@ -47,6 +47,8 @@ class ScheduledOptimizer:
     def update_learning_rate(self, epoch):
         """
         Actualiza el learning rate basado en el epoch actual.
+        Solo maneja el Warm-up. Después del warm-up, deja que un Scheduler externo (ej: ReduceLROnPlateau)
+        maneje el LR.
         
         Args:
             epoch: Epoch actual (0-indexed)
@@ -57,23 +59,18 @@ class ScheduledOptimizer:
         if epoch < self.warmup_epochs:
             # LR crece linealmente de 0 a initial_lr
             self.current_lr = self.initial_lr * (epoch + 1) / self.warmup_epochs
-        else:
-            # Después del warm-up, mantener o decrementar
-            # Opción 1: Mantener constante
-            self.current_lr = self.initial_lr
             
-            # Opción 2: Decaimiento exponencial (comentado por defecto)
-            # decay_rate = 0.5
-            # decay_epochs = 5
-            # epochs_after_warmup = epoch - self.warmup_epochs
-            # self.current_lr = self.initial_lr * (decay_rate ** (epochs_after_warmup / decay_epochs))
+            # Aplicar nuevo learning rate
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.current_lr
         
-        # Aplicar nuevo learning rate
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = self.current_lr
+        # Si no es warmup, NO tocamos el LR aquí para no interferir con ReduceLROnPlateau
     
     def get_learning_rate(self):
-        """Retorna el learning rate actual."""
+        """Retorna el learning rate actual del optimizador."""
+        # Devolver el LR real del optimizador (por si lo cambió un scheduler externo)
+        for param_group in self.optimizer.param_groups:
+            return param_group['lr']
         return self.current_lr
     
     def _get_parameters(self):
@@ -100,49 +97,73 @@ class ScheduledOptimizer:
         self.current_lr = state_dict['current_lr']
 
 
-def build_optimizer(model, config):
+def build_optimizer(model, config=None, learner=None, lr=None, warmup_epochs=None, grad_clip=None):
     """
     Construye el optimizer basado en la configuración.
     
     Args:
         model: Modelo PyTorch
-        config: Config object
+        config: Config object (opcional)
+        learner: Tipo de optimizador (opcional, override config)
+        lr: Learning rate (opcional, override config)
+        warmup_epochs: Epochs de warmup (opcional, override config)
+        grad_clip: Gradient clipping (opcional, override config)
         
     Returns:
         ScheduledOptimizer
     """
-    learner_type = (config['learner'] if config['learner'] else 'adam').lower()
-    learning_rate = config['learning_rate']
-    if learning_rate =='adagrad':
+    # Resolver parámetros (prioridad: argumentos explícitos > config > defaults)
+    if config is not None:
+        _learner = learner if learner is not None else config.get('learner', 'adam')
+        _lr = lr if lr is not None else config.get('learning_rate', 0.001)
+        _warmup = warmup_epochs if warmup_epochs is not None else config.get('warmup_epochs', 0)
+        _grad_clip = grad_clip if grad_clip is not None else config.get('grad_clip', 0.0)
+    else:
+        _learner = learner if learner is not None else 'adam'
+        _lr = lr if lr is not None else 0.001
+        _warmup = warmup_epochs if warmup_epochs is not None else 0
+        _grad_clip = grad_clip if grad_clip is not None else 0.0
+
+    learner_type = _learner.lower()
+    
+    if learner_type =='adagrad':
         base_optimizer = optim.Adagrad(
             model.parameters(),
-            lr=learning_rate,
-            epsilon=1e-6,
+            lr=_lr,
             initial_accumulator_value=0.1
         )
-    if learner_type == 'adam':
+    elif learner_type == 'adam':
         base_optimizer = optim.Adam(
             model.parameters(),
-            lr=learning_rate,
+            lr=_lr,
             betas=(0.9, 0.999),
-            eps=1e-8
+            eps=1e-6
+        )
+    elif learner_type == 'adamw':
+        base_optimizer = optim.AdamW(
+            model.parameters(),
+            lr=_lr,
+            betas=(0.9, 0.999),
+            eps=1e-6,
+            weight_decay=0.01
         )
     elif learner_type == 'sgd':
         base_optimizer = optim.SGD(
             model.parameters(),
-            lr=learning_rate,
+            lr=_lr,
             momentum=0.9
-        )
-    elif learner_type == 'adagrad':
-        base_optimizer = optim.Adagrad(
-            model.parameters(),
-            lr=learning_rate,
-            initial_accumulator_value=0.1
         )
     else:
         raise ValueError(f"Optimizer desconocido: {learner_type}")
     
+    # Config sintética para ScheduledOptimizer
+    opt_config = {
+        'learning_rate': _lr,
+        'warmup_epochs': _warmup,
+        'grad_clip': _grad_clip
+    }
+    
     # Envolver en ScheduledOptimizer
-    scheduled_optimizer = ScheduledOptimizer(base_optimizer, config)
+    scheduled_optimizer = ScheduledOptimizer(base_optimizer, opt_config)
     
     return scheduled_optimizer

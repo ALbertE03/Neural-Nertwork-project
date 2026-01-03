@@ -172,6 +172,16 @@ class BeamSearch:
                 if step < self.min_len:
                     log_probs[self.end_id] = -1e20
                 
+                # --- Trigram Blocking ---
+                # Si generar este token crearía un trigrama repetido, penalizarlo
+                if len(hyp.tokens) >= 2:
+                    current_trigram_prefix = tuple(hyp.tokens[-2:])
+                    for i in range(len(hyp.tokens) - 2):
+                        if tuple(hyp.tokens[i:i+2]) == current_trigram_prefix:
+                            forbidden_token = hyp.tokens[i+2]
+                            log_probs[forbidden_token] = -1e20
+                # ------------------------
+
                 # Top-k candidatos
                 top_k_log_probs, top_k_ids = torch.topk(log_probs, self.beam_size * 2)
                 
@@ -201,11 +211,10 @@ class BeamSearch:
         if len(completed) == 0:
             completed = hypotheses
         
-        # Ordenar por avg_log_prob y retornar la mejor
+        # Ordenar por avg_log_prob
         completed.sort(key=lambda h: h.avg_log_prob, reverse=True)
-        best_hypothesis = completed[0]
         
-        return best_hypothesis
+        return completed
     
     def decode_batch(self, data_loader, num_examples=None):
         """
@@ -240,7 +249,8 @@ class BeamSearch:
                     }
                     
                     # Beam search
-                    best_hyp = self.search(single_batch)
+                    hypotheses = self.search(single_batch)
+                    best_hyp = hypotheses[0]
                     generated_sequences.append(best_hyp.tokens)
                     
                     if num_examples is not None and len(generated_sequences) >= num_examples:

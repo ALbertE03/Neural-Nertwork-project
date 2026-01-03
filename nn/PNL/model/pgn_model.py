@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from encoder import Encoder
 from decoder import Decoder
-
 class PointerGeneratorNetwork(nn.Module):
     """
     Pointer-Generator Network con Coverage Mechanism para text summarization.
@@ -253,6 +253,7 @@ class PointerGeneratorNetwork(nn.Module):
         
         generated_ids = []
         p_gens = []
+        log_probs = []
                 
         for t in range(max_len):
             final_dist, decoder_state, context_vector, attention_dist, p_gen, coverage = self.decoder(
@@ -266,8 +267,11 @@ class PointerGeneratorNetwork(nn.Module):
             )
             
             # Greedy: seleccionar el token con mayor probabilidad
-            predicted_ids = torch.argmax(final_dist, dim=1)  # (batch_size,)
+            probs, predicted_ids = torch.max(final_dist, dim=1)
+            log_prob = torch.log(probs + 1e-12)
+            
             generated_ids.append(predicted_ids)
+            log_probs.append(log_prob)
             
             # Guardamos p_gen (si es None por no-pgen, guardamos 1.0 = generación pura)
             if p_gen is not None:
@@ -284,4 +288,5 @@ class PointerGeneratorNetwork(nn.Module):
         
         generated_ids = torch.stack(generated_ids, dim=1)  # (batch_size, max_len)
         p_gens = torch.stack(p_gens, dim=1) # (batch_size, max_len, 1)
-        return generated_ids, p_gens
+        log_probs = torch.stack(log_probs, dim=1)
+        return generated_ids, p_gens, log_probs

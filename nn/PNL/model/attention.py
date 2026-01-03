@@ -67,7 +67,6 @@ class Attention(nn.Module):
         e = e.squeeze(2)  # (batch_size, src_len)
         
         # 6. Aplicar máscara (hacer -inf los padding para que softmax → 0)
-        # Usamos -1e4 en lugar de -1e9 para evitar overflow en FP16 (AMP)
         e = e.masked_fill(encoder_mask == 0, -1e4)
         
         # 7. Softmax para obtener distribución de atención

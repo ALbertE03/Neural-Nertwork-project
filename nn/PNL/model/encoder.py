@@ -24,14 +24,14 @@ class Encoder(nn.Module):
         self.hidden_size = hidden_size
         self.num_enc_layers = num_enc_layers
         self.bidirectional = bidirectional
-        self.dropout = nn.Dropout(dropout_ratio)
+        
         # Embedding layer (solo para vocabulario base)
         self.embedding = nn.Embedding(vocab_size, embedding_size, padding_idx=0)
         
         if pretrained_weights is not None:
             self.embedding.weight.data.copy_(pretrained_weights)
             self.embedding.weight.requires_grad = False 
-            print("✓ Encoder: Pesos de embedding inicializados (no Entrenables)")
+            print("✓ Encoder: Pesos de embedding inicializados (no Entrenables).")
         
         # LSTM bidireccional
         self.lstm = nn.LSTM(
@@ -42,7 +42,7 @@ class Encoder(nn.Module):
             bidirectional=bidirectional,
             dropout=dropout_ratio if num_enc_layers > 1 else 0
         )
-        
+        self.dropout = nn.Dropout(dropout_ratio)
         # Proyección para reducir hidden state bidireccional
         if bidirectional:
             self.reduce_h = nn.Linear(hidden_size * 2, hidden_size)

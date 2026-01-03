@@ -12,20 +12,27 @@ import nltk
 from pgn_model import PointerGeneratorNetwork
 from beam_search import BeamSearch
 from dataset import PGNDataset, pgn_collate_fn
+from finetune import FinetuneDataset  # Importar dataset de fine-tuning
 from vocabulary import Vocabulary
 from config import Config
 from constant import *
 
-# Descargar recursos de NLTK necesarios para METEOR
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt', quiet=True)
-try:
-    nltk.data.find('corpora/wordnet')
-except LookupError:
-    nltk.download('wordnet', quiet=True)
+# Descargar recursos de NLTK necesarios para METEOR de forma segura
+def download_nltk_resource(resource, name):
+    try:
+        nltk.data.find(resource)
+    except LookupError:
+        print(f"⚠ Recurso NLTK '{name}' no encontrado. Intentando descargar...")
+        try:
+            nltk.download(name, quiet=True)
+            print(f"✓ '{name}' descargado.")
+        except Exception as e:
+            print(f"⚠ No se pudo descargar '{name}' (posible falta de conexión). METEOR podría fallar.")
 
+"""download_nltk_resource('tokenizers/punkt', 'punkt')
+download_nltk_resource('corpora/wordnet', 'wordnet')
+download_nltk_resource('tokenizers/punkt_tab', 'punkt_tab') # A veces necesario en versiones nuevas
+"""
 
 def decode_sequence_to_text(id_sequence, vocab, oov_id_to_word):
     """Decodifica una secuencia de IDs a texto."""
@@ -124,6 +131,44 @@ def calculate_meteor(reference, candidate):
     except Exception as e:
         print(f"⚠ Error calculando METEOR: {e}")
         return 0.0
+
+
+class TestSingleFileDataset(PGNDataset):
+    """Dataset para cargar un único archivo de test (ej: data_027)."""
+    def __init__(self, vocab, MAX_LEN_SRC, MAX_LEN_TGT, src_dir, tgt_dir, file_id):
+        self.vocab = vocab
+        self.MAX_LEN_SRC = MAX_LEN_SRC
+        self.MAX_LEN_TGT = MAX_LEN_TGT
+        self.is_tokenized = False 
+        
+        self.PAD_ID = self.vocab.word2id(self.vocab.pad_token)
+        self.SOS_ID = self.vocab.word2id(self.vocab.start_decoding)
+        self.EOS_ID = self.vocab.word2id(self.vocab.end_decoding)
+        self.UNK_ID = self.vocab.word2id(self.vocab.unk_token)
+
+        self.src_lines = []
+        self.tgt_lines = []
+        
+        src_file = f"data_{file_id}.src.txt"
+        tgt_file = f"target_{file_id}.tgt.txt"
+        
+        src_path = os.path.join(src_dir, src_file)
+        tgt_path = os.path.join(tgt_dir, tgt_file)
+        
+        if os.path.exists(src_path) and os.path.exists(tgt_path):
+            print(f"Cargando archivo único de test: {src_file}")
+            with open(src_path, 'r', encoding='utf-8') as f:
+                src_content = f.readlines()
+            with open(tgt_path, 'r', encoding='utf-8') as f:
+                tgt_content = f.readlines()
+            
+            # Filtrar líneas vacías
+            self.src_lines = [l.strip() for l in src_content if l.strip()]
+            self.tgt_lines = [l.strip() for l in tgt_content if l.strip()]
+        else:
+            raise FileNotFoundError(f"No se encontraron los archivos para ID {file_id} en {src_dir}")
+            
+        print(f"✓ Dataset cargado: {len(self.src_lines)} ejemplos")
 
 
 class Evaluator:
@@ -244,7 +289,9 @@ class Evaluator:
                     
                     # Generar resumen
                     if self.config['decoding_strategy'] == 'beam_search':
-                        hypothesis = self.beam_search.search(single_batch)
+                        hypotheses = self.beam_search.search(single_batch)
+                        # search devuelve una lista de hipótesis, tomamos la mejor (la primera)
+                        hypothesis = hypotheses[0]
                         generated_ids = hypothesis.tokens[1:]  # Quitar START
                         # Extraer p_gens de la hipótesis (lista de tensores (1,1))
                         p_gens_list = hypothesis.p_gens
@@ -535,15 +582,41 @@ def main():
         gpu_id=GPU_ID
     )
     
+    # Ruta del modelo
+    # Priorizar modelo fine-tuned si existe
+    finetune_path = os.path.join(BASE_DIR, 'saved', 'finetune', 'finetune_best-v2.pt')
+    if os.path.exists(finetune_path):
+        print(f"✓ Detectado modelo Fine-Tuned en {finetune_path}")
+        model_path = finetune_path
+        is_finetuned = False
+    else:
+        model_path = os.path.join(BASE_DIR, 'saved', 'working', 'checkpoint_best2.pt')
+        is_finetuned = False
+        
     # 3. Dataset de test
-    print("\nCargando dataset de test...")
-    test_dataset = PGNDataset(
-        vocab=vocab,
-        MAX_LEN_SRC=config['src_len'],
-        MAX_LEN_TGT=config['tgt_len'],
-        data_dir=DATA_DIR,
-        split='test'
-    )
+    if is_finetuned:
+        print("\nCargando dataset de Fine-Tuning (SOLO TEST - data_027)...")
+        src_dir = os.path.join(DATA_DIR, 'outputs_src')
+        tgt_dir = os.path.join(DATA_DIR, 'outputs_tgt')
+        
+        test_dataset = TestSingleFileDataset(
+            vocab=vocab,
+            MAX_LEN_SRC=config['src_len'],
+            MAX_LEN_TGT=config['tgt_len'],
+            src_dir=src_dir,
+            tgt_dir=tgt_dir,
+            file_id="027"
+        )
+        print(f"✓ Objetivo: Evaluar exclusivamente data_027")
+    else:
+        print("\nCargando dataset de test estándar...")
+        test_dataset = PGNDataset(
+            vocab=vocab,
+            MAX_LEN_SRC=config['src_len'],
+            MAX_LEN_TGT=config['tgt_len'],
+            data_dir=DATA_DIR,
+            split='test'
+        )
     
     print(f"✓ Test: {len(test_dataset)} ejemplos")
     
@@ -555,19 +628,9 @@ def main():
         num_workers=0
     )
     
-    # 4. Ruta del modelo
-    model_path = os.path.join(CHECKPOINT_DIR, 'checkpoint_best.pt')
-    
-    if not os.path.exists(model_path):
-        model_path = os.path.join(CHECKPOINT_DIR, 'checkpoint_last.pt')
-    
-    if not os.path.exists(model_path):
-        print(f"⚠ No se encontró ningún checkpoint en {CHECKPOINT_DIR}")
-        return
-    
     output_dir = GENERATED_TEXT_DIR
     
-    # 5. Graficar pérdida de entrenamiento (desde el checkpoint)
+    #  Graficar pérdida de entrenamiento (desde el checkpoint)
     plot_training_history(output_dir, model_path)
     
     # 6. Evaluar
@@ -575,7 +638,7 @@ def main():
     
     metrics, results = evaluator.evaluate(
         test_loader,
-        num_examples=None  # None = todos
+        num_examples=None  # Evaluar TODOS
     )
     
     # 7. Mostrar resultados
@@ -593,12 +656,12 @@ def main():
     # 8. Guardar resultados
     evaluator.save_results(metrics, results, output_dir)
     
-    # 9. Mostrar algunos ejemplos
+    # 9. Mostrar ejemplos
     print(f"\n{'='*60}")
     print("EJEMPLOS DE RESÚMENES GENERADOS")
     print(f"{'='*60}\n")
     
-    for i, result in enumerate(results[:3]):
+    for i, result in enumerate(results[:5]):
         print(f"Ejemplo {i+1}:")
         print(f"REFERENCE: {result['reference'][:150]}...")
         print(f"GENERATED: {result['candidate'][:150]}...")

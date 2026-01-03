@@ -20,6 +20,8 @@ def _clean_text( text,for_vocab=False):
         text = re.sub(url_pattern, ' ', text)
         # 3. Limpieza de caracteres especiales y ruido
         text = text.replace('\xa0', ' ')
+        text = re.sub(r'(LEA TAMBIÉN|LE PUEDE INTERESAR|MIRA TAMBIÉN).*?(?=(\.|$))', ' ', text, flags=re.IGNORECASE)
+
         # Caracteres decorativos repetidos
         text = re.sub(r'[~*\-_=]{2,}', ' ', text)
 
@@ -53,6 +55,8 @@ def _tokens_from_doc(doc, for_vocab=False):
             t = token.text
             t = t.replace('``', '"').replace("''", '"')
             if t:
+                if t == '.':
+                    t = t.replace(".", '[.]')
                 tokens.append(t)
         return tokens
 def preprocess_files(files, is_source=True):
@@ -64,15 +68,29 @@ def preprocess_files(files, is_source=True):
     nlp = spacy.load("es_core_news_sm", disable=['ner','lemmatizer','morphologizer','attribute_ruler'])
     nlp.add_pipe('sentencizer')
     for file_path, original_name in files:
-        output_path = original_name + ".tokenized"
+        output_path = original_name.replace(".json",'txt') + ".tokenized"
         if not os.path.isabs(output_path):
             output_path = os.path.join(DATA_DIR, output_path)
             
         print(f"Procesando {os.path.basename(file_path)} -> {os.path.basename(output_path)}")
         
         def line_generator(path):
+            import json
             with open(path, "r", encoding="utf-8") as f:
-                for line in f:
+                try:
+                    data = json.load(f)
+                except:
+                    return
+                
+                if 'text' not in data:
+                    return
+                
+                da = data['text']
+                # Ensure it is iterable
+                if isinstance(da, str):
+                    da = [da]
+                    
+                for line in da:
                     yield _clean_text(line, for_vocab=False)
         
 
@@ -97,32 +115,33 @@ def preprocess_files(files, is_source=True):
 def main():
     print("=== INICIANDO PREPROCESAMIENTO ===")
     
-
-    # 2. Definir archivos
-    splits = ['train', 'val', 'test']
+    w ='/Users/alberto/Desktop/Neural-Nertwork-project/nn/PNL/data/Copia de Data_articles/Data_articles1'
+    data = os.listdir(w)
     src_files = []
-    tgt_files = []
+    import json
+
     
-    for split in splits:
-        s_name = f"{split}.txt.src"
-        t_name = f"{split}.txt.tgt"
-        s_path = os.path.join(DATA_DIR, s_name)
-        t_path = os.path.join(DATA_DIR, t_name)
+    for split in data:
+        if not split.endswith('.json'):
+            continue
+
+        d = json.load(open(split))
+
+        s_path = os.path.join(w, split)
         
         if os.path.exists(s_path):
-            src_files.append((s_path, s_name))
-        if os.path.exists(t_path):
-            tgt_files.append((t_path, t_name))
+            src_files.append((s_path, split))
+
             
     # 3. Procesar
     if src_files:
         print(f"\nArchivos Source encontrados: {len(src_files)}")
         preprocess_files(src_files, is_source=True)
     
-    if tgt_files:
+    """if tgt_files:
         print(f"\nArchivos Target encontrados: {len(tgt_files)}")
         preprocess_files(tgt_files, is_source=False)
-    
+    """
     print("\n=== PREPROCESAMIENTO COMPLETADO ===")
 
 if __name__ == "__main__":

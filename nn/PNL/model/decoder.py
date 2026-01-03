@@ -1,8 +1,8 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from attention import Attention
-
 class Decoder(nn.Module):
     """
     Decoder LSTM con Pointer-Generator Network y Coverage Mechanism.
@@ -36,10 +36,10 @@ class Decoder(nn.Module):
         self.is_attention = is_attention
         self.is_pgen = is_pgen
         self.is_coverage = is_coverage
-        
+        self.dropout = nn.Dropout(dropout_ratio)
         # Embedding layer (solo para vocabulario base)
         self.embedding = nn.Embedding(vocab_size, embedding_size, padding_idx=0)
-        self.dropout = nn.Dropout(dropout_ratio)
+        
         # LSTM decoder
         # Input: embedding + context vector (si hay atención)
         lstm_input_size = embedding_size + (hidden_size * 2 if is_attention else 0)
@@ -51,9 +51,7 @@ class Decoder(nn.Module):
             batch_first=True,
             dropout=dropout_ratio if num_dec_layers > 1 else 0
         )
-         # Normalización por capas para embeddings y salidas del LSTM
-        self.emb_ln = nn.LayerNorm(embedding_size)
-        self.lstm_out_ln = nn.LayerNorm(hidden_size)
+        
         # Attention mechanism
         if is_attention:
             self.attention = Attention(hidden_size, is_coverage=is_coverage)
@@ -145,7 +143,7 @@ class Decoder(nn.Module):
             
             # Crear distribución extendida
             src_len = extended_encoder_input.size(1)
-            extended_vocab_size = self.vocab_size + src_len 
+            extended_vocab_size = self.vocab_size + src_len  # Aproximación conservadora
             
             # Inicializar distribución extendida
             final_dist = torch.zeros(batch_size, extended_vocab_size, device=vocab_dist.device)

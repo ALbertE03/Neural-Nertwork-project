@@ -114,6 +114,8 @@ class PGNDataset(Dataset):
                 # Fast path: Ya está tokenizado por palabras
                 sentence_tokens = sentence.split()
                 tokens_to_add = sentence_tokens
+            else:
+                tokens_to_add = sentence.strip().split()
             
             if len(trimmed_src_tokens) + len(tokens_to_add) > self.MAX_LEN_SRC:
                 break
@@ -139,10 +141,13 @@ class PGNDataset(Dataset):
         
         # --- 3. Decoder ---
         if self.is_tokenized:
-            tgt_tokens = tgt_line.strip().split(' [.]')
-        
+            # Asumimos que el target tokenizado está separado por espacios
+            # Si hay separadores de oraciones [.] los tratamos como tokens o los ignoramos según el caso
+            # Aquí simplemente hacemos split por espacios
+            tgt_tokens = tgt_line.strip().split()
         else:
-            raise "tokeniza primero el dataset con preprocess_data.py"
+            # Fallback para texto crudo
+            tgt_tokens = tgt_line.strip().split()
         
         tgt_ext_ids = self._map_target_to_extended_ids(tgt_tokens, oov_map)
         

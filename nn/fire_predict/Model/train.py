@@ -4,9 +4,9 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 import os
 from tqdm import tqdm
-from utils import iou_score,dice_loss
 from constants import *
-from dataset import *
+from model import FirePredictModel
+from utils import dice_loss, iou_score, burned_area_error, centroid_distance_error, f1_score, precision_score, recall_score, physical_area_consistency, cluster_count_diff
 
 def train_epoch(model, loader, optimizer, scaler, device, pred_horizon=2, accum_steps=4):
     """
@@ -26,35 +26,26 @@ def train_epoch(model, loader, optimizer, scaler, device, pred_horizon=2, accum_
         
         B, T, C, H, W = x.shape
         
-        # Necesitamos al menos pred_horizon+1 días
-        if T <= pred_horizon:
-            continue
         
-        # Input: toda la secuencia menos los últimos pred_horizon días
-        input_seq = x[:, :-pred_horizon]  # (B, T-2, C, H, W)
+        # Input: toda la secuencia menos el último día
+        input_seq = x[:, :-pred_horizon]  # (B, T-1, C, H, W)
         
-        # Targets: los últimos pred_horizon días
-        targets = []
-        for k in range(1, pred_horizon + 1):
-            target_idx = T - pred_horizon + k - 1
-            targets.append(labels[:, target_idx])  # (B, H, W)
-        
-        target = torch.stack(targets, dim=1)  # (B, 2, H, W)
-        target_mask = torch.stack([
-            label_mask[:, T - pred_horizon + k - 1] 
-            for k in range(1, pred_horizon + 1)
-        ], dim=1)  # (B, 2, H, W)
+        # Target: el último día
+        target = labels[:, -1]  # (B, H, W)
+        target_mask = label_mask[:, -1]  # (B, H, W)
         
         # Forward con autocast para AMP
         with torch.amp.autocast(device_type=device.type if device.type != 'cpu' else 'cuda'):
-            pred = model(input_seq)  # (B, 2, H, W)
+            pred = model(input_seq)  # (B, H, W)
             
             # Loss: BCE + Dice, solo donde mask=1
-            bce = nn.functional.binary_cross_entropy(pred, target, reduction='none')
+            bce = nn.functional.binary_cross_entropy_with_logits(
+                pred, target, reduction='none'
+            )
             bce = (bce * target_mask).sum() / (target_mask.sum() + 1e-8)
             
-            dice = dice_loss(pred, target, target_mask)
-            loss = (bce + dice) / accum_steps  # Escalar loss por accumulation steps
+            dice = dice_loss(pred.unsqueeze(1), target.unsqueeze(1), target_mask.unsqueeze(1), use_sigmoid=True)
+            loss = (bce + dice) / accum_steps
 
         # Backward con scaler
         scaler.scale(loss).backward()
@@ -82,12 +73,23 @@ def validate(model, loader, device, pred_horizon=2):
     """Evalúa el modelo en datos de validación."""
     model.eval()
     total_iou = 0
+    total_f1 = 0
+    total_precision = 0
+    total_recall = 0
+    total_area_error = 0
+    total_centroid_error = 0
+    total_phys_diff = 0
+    total_phys_rel_err = 0
+    total_cluster_diff = 0
     total_samples = 0
-    
-    for batch in loader:
+    pbar = tqdm(loader, desc="Validating")
+    for batch in pbar:
         x = batch['x'].to(device)
         labels = batch['label'].to(device)
         label_mask = batch['label_mask'].to(device)
+        pixel_area = batch['pixel_area'].to(device)
+        original_area = batch['original_area'].to(device)
+        original_count = batch['original_count'].to(device)
         
         B, T, C, H, W = x.shape
         if T <= pred_horizon:
@@ -95,27 +97,80 @@ def validate(model, loader, device, pred_horizon=2):
         
         input_seq = x[:, :-pred_horizon]
         
-        targets = torch.stack([
-            labels[:, T - pred_horizon + k - 1] 
-            for k in range(1, pred_horizon + 1)
-        ], dim=1)
-        
-        target_mask = torch.stack([
-            label_mask[:, T - pred_horizon + k - 1] 
-            for k in range(1, pred_horizon + 1)
-        ], dim=1)
+        target = labels[:, -1]
+        target_mask = label_mask[:, -1]
+        target_area = pixel_area[:, -1]
+        target_orig_area = original_area[:, -1]
+        target_orig_count = original_count[:, -1]
         
         with torch.amp.autocast(device_type=device.type if device.type != 'cpu' else 'cuda'):
             pred = model(input_seq)
+            
+        pred_probs = torch.sigmoid(pred) 
         
-        # IoU para cada día predicho
-        for k in range(pred_horizon):
-            iou = iou_score(pred[:, k], targets[:, k], target_mask[:, k])
-            total_iou += iou * B
+        # IoU
+        iou = iou_score(pred_probs, target, target_mask)
+        total_iou += iou * B
         
-        total_samples += B * pred_horizon
+        # F1, Precision, Recall
+        f1 = f1_score(pred_probs, target, target_mask)
+        prec = precision_score(pred_probs, target, target_mask)
+        rec = recall_score(pred_probs, target, target_mask)
+        
+        total_f1 += f1 * B
+        total_precision += prec * B
+        total_recall += rec * B
+        
+        # Area Error
+        area_err = burned_area_error(
+            pred_probs.unsqueeze(1), 
+            target.unsqueeze(1), 
+            target_area.unsqueeze(1), 
+            target_mask.unsqueeze(1)
+        )
+        total_area_error += area_err * B
+
+        # Centroid Error
+        centroid_err = centroid_distance_error(
+            pred_probs.unsqueeze(1),
+            target.unsqueeze(1),
+            target_area.unsqueeze(1),
+            target_mask.unsqueeze(1)
+        )
+        total_centroid_error += centroid_err * B
+        
+        # Physical Area Consistency
+        phys_metrics = physical_area_consistency(
+            mask_proj=pred_probs, 
+            pixel_area_proj=target_area, 
+            area_orig=target_orig_area,
+            threshold=0.5
+        )
+        total_phys_diff += phys_metrics['diff_mean'] * B
+        total_phys_rel_err += phys_metrics['rel_error'] * B
+        
+        # Cluster Count Difference
+        cluster_diff = cluster_count_diff(
+            pred=pred_probs,
+            target_count=target_orig_count,
+            mask=target_mask,
+            threshold=0.5
+        )
+        total_cluster_diff += cluster_diff * B
+        
+        total_samples += B
     
-    return total_iou / max(total_samples, 1)
+    return (
+        total_iou / max(total_samples, 1), 
+        total_f1 / max(total_samples, 1),
+        total_precision / max(total_samples, 1),
+        total_recall / max(total_samples, 1),
+        total_area_error / max(total_samples, 1),
+        total_centroid_error / max(total_samples, 1),
+        total_phys_diff / max(total_samples, 1),
+        total_phys_rel_err / max(total_samples, 1),
+        total_cluster_diff / max(total_samples, 1)
+    )
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, best_iou, filepath='checkpoint.pth'):
@@ -149,11 +204,9 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Usando dispositivo: {device}")
     
-    # Modelo
     model = FirePredictModel(
         input_channels=INPUT_CHANNELS,  
         hidden_channels=HIDDEN_CHANNELS,
-        pred_horizon=PRED_SEQ_LEN,
         dropout=DROPOUT
     ).to(device)
     
@@ -164,22 +217,22 @@ def main():
     
     start_epoch, best_iou = load_checkpoint(model, optimizer, scheduler, 'checkpoint.pth')
     
-    # Scaler para AMP
     scaler = torch.amp.GradScaler(enabled=(device.type != 'cpu'))
     
     
     for epoch in range(start_epoch, EPOCHS):
+        print(f"Epoch {epoch+1}/{EPOCHS}")
         train_loss = train_epoch(model, dataloader_train, optimizer, scaler, device, PRED_SEQ_LEN, ACCUM_STEPS)
-        val_iou = validate(model, dataloader_val, device, PRED_SEQ_LEN)
+        val_iou, val_f1, val_prec, val_rec, val_area_err, val_centroid_err, val_phys_diff, val_phys_rel, val_cluster_diff = validate(model, dataloader_val, device, PRED_SEQ_LEN)
         
         scheduler.step(val_iou)
         
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {train_loss:.4f} | Val IoU: {val_iou:.4f}")
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {train_loss:.4f} | Val IoU: {val_iou:.4f} | F1: {val_f1:.4f} | Prec: {val_prec:.4f} | Rec: {val_rec:.4f} | Area Err: {val_area_err:.2f} | Centroid Err: {val_centroid_err:.2f}m | Phys Diff: {val_phys_diff:.2f}m2 | Phys Rel Err: {val_phys_rel:.4f} | Cluster Diff: {val_cluster_diff:.2f}")
         
         if val_iou > best_iou:
             best_iou = val_iou
             torch.save(model.state_dict(), 'best_model.pth')
-            print(f"  ✓ Mejor modelo guardado (IoU: {best_iou:.4f})")
+            print(f"  Mejor modelo guardado (IoU: {best_iou:.4f})")
         
         save_checkpoint(model, optimizer, scheduler, epoch, best_iou, 'checkpoint.pth')
     

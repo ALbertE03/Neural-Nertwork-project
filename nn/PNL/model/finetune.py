@@ -1,4 +1,5 @@
 import torch
+import torch.optim as optim
 from torch.utils.data import DataLoader
 import os
 import json
@@ -10,6 +11,76 @@ from vocabulary import Vocabulary
 from config import Config
 from optimizer import build_optimizer
 from constant import *
+
+
+class FinetuneDataset(PGNDataset):
+    """
+    Dataset para Fine-tuning que carga datos desde directorios de archivos múltiples.
+    """
+    def __init__(self, vocab, MAX_LEN_SRC, MAX_LEN_TGT, src_dir, tgt_dir):
+        self.vocab = vocab
+        self.MAX_LEN_SRC = MAX_LEN_SRC
+        self.MAX_LEN_TGT = MAX_LEN_TGT
+        self.is_tokenized = False 
+        
+        self.PAD_ID = self.vocab.word2id(self.vocab.pad_token)
+        self.SOS_ID = self.vocab.word2id(self.vocab.start_decoding)
+        self.EOS_ID = self.vocab.word2id(self.vocab.end_decoding)
+        self.UNK_ID = self.vocab.word2id(self.vocab.unk_token)
+
+        self.src_lines = []
+        self.tgt_lines = []
+
+        # Listar archivos
+        if not os.path.exists(src_dir):
+             raise FileNotFoundError(f"Directory not found: {src_dir}")
+
+        src_files = sorted([f for f in os.listdir(src_dir) if f.endswith('.src.txt')])
+        
+        print(f"Escaneando {len(src_files)} archivos en {src_dir}...")
+        
+        for src_file in src_files:
+            # Extraer ID: data_001.src.txt -> 001
+            try:
+                # Asumiendo formato data_XXX.src.txt
+                parts = src_file.split('_')
+                if len(parts) < 2: continue
+                
+                file_id = parts[1].split('.')[0]
+                tgt_file = f"target_{file_id}.tgt.txt"
+                
+                src_path = os.path.join(src_dir, src_file)
+                tgt_path = os.path.join(tgt_dir, tgt_file)
+                
+                if os.path.exists(tgt_path):
+                    with open(src_path, 'r', encoding='utf-8') as f:
+                        src_content = f.readlines()
+                    with open(tgt_path, 'r', encoding='utf-8') as f:
+                        tgt_content = f.readlines()
+                    
+                    # Filtrar líneas vacías y asegurar correspondencia
+                    # Asumimos correspondencia línea a línea estricta
+                    if len(src_content) != len(tgt_content):
+                        # Intentar sincronizar eliminando vacíos
+                        src_clean = [l.strip() for l in src_content if l.strip()]
+                        tgt_clean = [l.strip() for l in tgt_content if l.strip()]
+                        
+                        if len(src_clean) == len(tgt_clean):
+                            self.src_lines.extend(src_clean)
+                            self.tgt_lines.extend(tgt_clean)
+                        else:
+                            print(f"⚠ Saltando {src_file}: Desajuste de líneas ({len(src_content)} vs {len(tgt_content)})")
+                    else:
+                        self.src_lines.extend([l.strip() for l in src_content])
+                        self.tgt_lines.extend([l.strip() for l in tgt_content])
+                else:
+                    # print(f"Warning: No target file found for {src_file}")
+                    pass
+            except Exception as e:
+                print(f"Error processing {src_file}: {e}")
+
+        assert len(self.src_lines) == len(self.tgt_lines)
+        print(f"✓ Dataset de Fine-tuning cargado: {len(self.src_lines)} pares de oraciones")
 
 
 class FineTuner:
@@ -46,6 +117,17 @@ class FineTuner:
             learner=finetune_config['optimizer'],
             lr=finetune_config['learning_rate'],
             warmup_epochs=finetune_config.get('warmup_epochs', 0)
+        )
+        
+        # Configurar Scheduler (ReduceLROnPlateau)
+        # Reduce el LR si la loss de validación no mejora
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer.optimizer, 
+            mode='min', 
+            factor=0.5, 
+            patience=1, 
+            verbose=True,
+            min_lr=1e-7
         )
         
         # Tracking
@@ -89,11 +171,14 @@ class FineTuner:
                 param.requires_grad = False
     
     def _train_epoch(self, train_loader):
-        """Entrena una época."""
+        """Entrena una época con Gradient Accumulation."""
         self.model.train()
         
         total_loss = 0.0
         num_batches = 0
+        
+        accumulation_steps = self.finetune_config.get('gradient_accumulation_steps', 1)
+        self.optimizer.zero_grad()  # Reset inicial
         
         pbar = tqdm(train_loader, desc=f"Epoch {self.current_epoch + 1}")
         
@@ -105,28 +190,45 @@ class FineTuner:
             outputs = self.model(batch, is_training=True)
             loss = outputs['loss']
             
-            # Backward pass
-            self.optimizer.zero_grad()
+            # Escalar loss para acumulación
+            loss = loss / accumulation_steps
+            
+            # Backward pass (acumula gradientes)
             loss.backward()
             
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.finetune_config['grad_clip']
-            )
+            # Paso de optimización cada N batches
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.finetune_config['grad_clip']
+                )
+                
+                # Update weights
+                self.optimizer.step()
+                
+                # Reset gradients
+                self.optimizer.zero_grad()
             
-            # Update
-            self.optimizer.step()
-            
-            # Tracking
-            total_loss += loss.item()
+            # Tracking (deshacer escalado para mostrar loss real)
+            current_loss = loss.item() * accumulation_steps
+            total_loss += current_loss
             num_batches += 1
             
             # Update progress bar
             pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
+                'loss': f"{current_loss:.4f}",
                 'avg_loss': f"{total_loss/num_batches:.4f}"
             })
+        
+        # Asegurar que se apliquen gradientes remanentes si el último batch no completó el ciclo
+        if (batch_idx + 1) % accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.finetune_config['grad_clip']
+            )
+            self.optimizer.step()
+            self.optimizer.zero_grad()
         
         pbar.close()
         
@@ -172,12 +274,12 @@ class FineTuner:
         }
         
         if is_best:
-            path = os.path.join(self.checkpoint_dir, 'finetune_best.pt')
+            path = os.path.join(self.checkpoint_dir, 'finetune_best-v2.pt')
             torch.save(checkpoint, path)
             print(f"✓ Mejor modelo guardado: {path}")
         
         if is_last:
-            path = os.path.join(self.checkpoint_dir, 'finetune_last.pt')
+            path = os.path.join(self.checkpoint_dir, 'finetune_last-v2.pt')
             torch.save(checkpoint, path)
         
         # Guardar por época si se especifica
@@ -202,7 +304,7 @@ class FineTuner:
             
             # Update learning rate (warmup)
             self.optimizer.update_learning_rate(epoch)
-            current_lr = self.optimizer.get_current_lr()
+            current_lr = self.optimizer.get_learning_rate()
             
             print(f"\nEpoch {epoch + 1}/{self.finetune_config['epochs']}")
             print(f"Learning Rate: {current_lr:.6f}")
@@ -212,6 +314,10 @@ class FineTuner:
             
             # Validate
             val_loss = self._validate_epoch(val_loader)
+            
+            # Step Scheduler (solo si ya pasó el warmup)
+            if epoch >= self.finetune_config.get('warmup_epochs', 0):
+                self.scheduler.step(val_loss)
             
             # Log
             print(f"\nEpoch {epoch + 1} Summary:")
@@ -292,36 +398,41 @@ def main():
     # 3. Configuración de fine-tuning
     finetune_config = {
         'optimizer': 'adam',
-        'learning_rate': 0.00005,  # LR más bajo que pre-entrenamiento
-        'epochs': 10,  # Menos épocas para fine-tuning
-        'batch_size': 16,  # Batch size más pequeño
+        'learning_rate': 0.00010,  # LR más bajo que pre-entrenamiento
+        'epochs': 15,  # Menos épocas para fine-tuning
+        'batch_size': 16,  # Batch size reducido para ahorrar memoria
+        'gradient_accumulation_steps': 1,  # Acumular gradientes (Batch efectivo = 16)
         'grad_clip': 2.0,
-        'warmup_epochs': 1,  # Poco warmup
-        'freeze_encoder': False,  # True para solo entrenar decoder
-        'freeze_embeddings': False,  # True para congelar embeddings
+        'warmup_epochs': 3,  # Poco warmup
+        'freeze_encoder': True,  # True para solo entrenar decoder
+        'freeze_embeddings': True,  # True para congelar embeddings
         'save_every_epoch': False,  # True para guardar cada época
         'checkpoint_dir': os.path.join(BASE_DIR, 'saved', 'finetune')
     }
     
     # 4. Cargar datasets
-    print("\nCargando datasets...")
+    print("\nCargando datasets de fine-tuning...")
     
-    train_dataset = PGNDataset(
+    src_dir = os.path.join(DATA_DIR, 'outputs_src')
+    tgt_dir = os.path.join(DATA_DIR, 'outputs_tgt')
+    
+    full_dataset = FinetuneDataset(
         vocab=vocab,
         MAX_LEN_SRC=config['src_len'],
         MAX_LEN_TGT=config['tgt_len'],
-        data_dir=DATA_DIR,
-        split='train'
+        src_dir=src_dir,
+        tgt_dir=tgt_dir
     )
     
-    val_dataset = PGNDataset(
-        vocab=vocab,
-        MAX_LEN_SRC=config['src_len'],
-        MAX_LEN_TGT=config['tgt_len'],
-        data_dir=DATA_DIR,
-        split='val'
-    )
+    # Split train/val (90/10)
+    val_size = int(0.1 * len(full_dataset))
+    train_size = len(full_dataset) - val_size
     
+    # Usar generador determinista
+    generator = torch.Generator().manual_seed(42)
+    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size], generator=generator)
+    
+    print(f"✓ Total: {len(full_dataset)} ejemplos")
     print(f"✓ Train: {len(train_dataset)} ejemplos")
     print(f"✓ Val: {len(val_dataset)} ejemplos")
     
@@ -342,18 +453,12 @@ def main():
     )
     
     # 5. Ruta del modelo pre-entrenado
-    pretrained_path = os.path.join(CHECKPOINT_DIR, 'checkpoint_best.pt')
-    
-    if not os.path.exists(pretrained_path):
-        pretrained_path = os.path.join(CHECKPOINT_DIR, 'checkpoint_last.pt')
-    
-    if not os.path.exists(pretrained_path):
-        print(f"⚠ No se encontró ningún checkpoint pre-entrenado en {CHECKPOINT_DIR}")
-        print("Debes entrenar el modelo primero con train.py")
-        return
-    
+    model_path = os.path.join('/Users/alberto/Desktop/Neural-Nertwork-project/nn/PNL/saved/working/checkpoint_best2.pt')
+        
+
+   
     # 6. Crear fine-tuner y ejecutar
-    finetuner = FineTuner(config, vocab, pretrained_path, finetune_config)
+    finetuner = FineTuner(config, vocab, model_path, finetune_config)
     finetuner.finetune(train_loader, val_loader)
 
 
