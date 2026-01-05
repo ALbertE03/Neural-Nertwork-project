@@ -32,17 +32,17 @@ class SpatialAttention(nn.Module):
         B, C, H, W = query.shape
         T = keys_values.shape[1]
         
-        # 1. Proyectar Query
+        # Proyectar Query
         # (B, C_att, H, W) -> (B, 1, C_att, H, W)
         Q_proj = self.query_conv(query).unsqueeze(1)
         
-        # 2. Proyectar Keys (procesar todo el batch*tiempo junto para eficiencia)
+        # Proyectar Keys (procesar todo el batch*tiempo junto para eficiencia)
         # (B*T, C, H, W)
         keys_flat = keys_values.view(B*T, C, H, W)
         K_proj = self.key_conv(keys_flat) # (B*T, C_att, H, W)
         K_proj = K_proj.view(B, T, -1, H, W) # (B, T, C_att, H, W)
         
-        # 3. Calcular Scores (Additive)
+        # Calcular Scores (Additive)
         # tanh(Q + K)
         # Broadcasting Q sobre T
         energy = torch.tanh(Q_proj + K_proj) # (B, T, C_att, H, W)
@@ -53,10 +53,10 @@ class SpatialAttention(nn.Module):
         scores = self.score_conv(energy_flat) # (B*T, 1, H, W)
         scores = scores.view(B, T, H, W) # (B, T, H, W)
         
-        # 4. Softmax
+        # Softmax
         attn_weights = F.softmax(scores, dim=1) # (B, T, H, W)
         
-        # 5. Weighted Sum
+        # Weighted Sum
         # Proyectar Values
         V_proj = self.value_conv(keys_flat).view(B, T, C, H, W)
         

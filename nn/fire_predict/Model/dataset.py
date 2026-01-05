@@ -3,7 +3,6 @@ import numpy as np
 import rasterio
 from pathlib import Path
 import os
-from scipy.ndimage import zoom, label
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from rasterio import Affine
@@ -99,7 +98,7 @@ class TSDataset(Dataset):
             # Etiquetas: [0, 1] estricto
             # Eliminar valores negativos (NoData)
             data[data < 0] = 0.0
-            # Clip a 1.0 (maneja valores 255 o acumulados)
+            # Clip a 1.0 
             data = np.clip(data, 0.0, 1.0)
         else:
             # Inputs: Limpiar basura negativa (ej. -9999)
@@ -129,18 +128,13 @@ class TSDataset(Dataset):
         return data
 
     def _preprocess(self, imgs, transforms, crss, is_day=False, is_night=False, is_fireP=False, target_shape=(256, 256)):
-        H_new, W_new = target_shape
         news_imgs = []
         labels = []
-        masks = []
         pixel_areas = []
-        original_areas = []
-        original_counts = []
     
         for img, src_transform, src_crs in zip(imgs, transforms, crss):
             if img.ndim == 2:
                 img = img[None, :, :]
-            C, h, w = img.shape
             
             if is_day:
                 # Separar datos y label
@@ -153,16 +147,6 @@ class TSDataset(Dataset):
                 
                 # Normalizar Label (raw_fire) ANTES de resize para que el average funcione bien sobre 0-1
                 raw_fire = self._normalize_data(raw_fire, is_label=True)
-                
-                # Calcular área original
-                orig_pixel_area = abs(src_transform.a * src_transform.e)
-                orig_fire_mask = raw_fire > 1e-5
-                orig_fire_area = orig_fire_mask.sum() * orig_pixel_area
-                original_areas.append(orig_fire_area)
-                
-                # Contar clusters originales
-                labeled_array, num_features = label(orig_fire_mask, structure=np.ones((3,3)))
-                original_counts.append(num_features)
                 
                 # Procesar DATOS con bilinear
                 img_resized, new_transform = self._resize_rasterio(
@@ -180,24 +164,23 @@ class TSDataset(Dataset):
                     target_shape=target_shape, resampling=Resampling.average
                 )
                 
-                # Procesar MASK con NEAREST
+                # Procesar MASK con AVERAGE para consistencia y luego binarizar
                 mask_resized, _ = self._resize_rasterio(
                     raw_mask[None, :, :], src_transform, src_crs,
-                    target_shape=target_shape, resampling=Resampling.nearest
+                    target_shape=target_shape, resampling=Resampling.average
                 )
+                # válido si hay al menos un poco de información válida 
+                
+                mask_resized = (mask_resized > 0.0001).astype(np.float32)
                 
                 # Asignar
                 fire_label = fire_resized[0] # Ya es soft label (0.0 - 1.0)
                 label_mask = mask_resized[0]
                 
-                # Máscara de datos (input)
-                mask = (~np.isnan(img_resized)).astype(np.float32)
-                
-                # Normalizar DATOS (Inputs)
+                # Normalizar (Inputs)
                 img_resized = self._normalize_data(img_resized, is_label=False)
                 
                 news_imgs.append(img_resized)
-                masks.append(mask)
                 labels.append((fire_label, label_mask))
                 
             else:
@@ -206,7 +189,7 @@ class TSDataset(Dataset):
                     resampling = Resampling.nearest
                 elif is_night:
                     resampling = Resampling.bilinear
-                else:  # LULC: nearest obligatorio
+                else:  # LULC: nearest 
                     resampling = Resampling.nearest
                 
                 # Resize con georeferencia
@@ -215,9 +198,6 @@ class TSDataset(Dataset):
                     target_shape=target_shape, resampling=resampling
                 )  # (C, 256, 256)
                 
-                # Máscara
-                mask = (~np.isnan(img_resized)).astype(np.float32)
-                
                 # Normalizar DATOS (Inputs)
                 # Si es fireP, quizás queramos tratarlo diferente, pero por ahora normalizamos todo
                 img_resized = self._normalize_data(img_resized, is_label=False)
@@ -225,16 +205,14 @@ class TSDataset(Dataset):
                 # Para night, si tiene 5 canales, tomar solo los últimos 2
                 if is_night and img_resized.shape[0] == 5:
                     img_resized = img_resized[-2:, :, :]
-                    mask = mask[-2:, :, :]
                 
                 news_imgs.append(img_resized)
-                masks.append(mask)
     
         if is_day:
             label_imgs, label_masks = zip(*labels) if labels else ([], [])
-            return news_imgs, masks, list(label_imgs), list(label_masks), pixel_areas, original_areas, original_counts
+            return news_imgs, list(label_imgs), list(label_masks), pixel_areas
         else:
-            return news_imgs, masks
+            return news_imgs
 
     def __getitem__(self, idx):
         paths = self.image_paths[idx+1]
@@ -244,13 +222,13 @@ class TSDataset(Dataset):
         static_img, t_static, crs_static = self.open_tif(paths['ESRI_LULC'])
 
         # Preprocesar con máscaras
-        day_imgs, day_masks, labels, label_masks, pixel_areas, original_areas, original_counts = self._preprocess(seq_day, t_day, crs_day, 
+        day_imgs, labels, label_masks, pixel_areas = self._preprocess(seq_day, t_day, crs_day, 
                                                                    is_day=True, target_shape=self.shapes)
-        night_imgs, night_masks = self._preprocess(seq_night, t_night, crs_night, 
+        night_imgs = self._preprocess(seq_night, t_night, crs_night, 
                                                   is_night=True, target_shape=self.shapes)
-        fire_imgs, fire_masks = self._preprocess(seq_firepred, t_fire, crs_fire, 
+        fire_imgs = self._preprocess(seq_firepred, t_fire, crs_fire, 
                                                 is_fireP=True, target_shape=self.shapes)
-        lulc_imgs, lulc_masks = self._preprocess(static_img, t_static, crs_static, 
+        lulc_imgs = self._preprocess(static_img, t_static, crs_static, 
                                                 target_shape=self.shapes)
 
         # Convertir a numpy
@@ -261,8 +239,6 @@ class TSDataset(Dataset):
         labels = np.array(labels).astype(np.float32)          # (T, H, W)
         label_masks = np.array(label_masks).astype(np.float32)
         pixel_areas = np.array(pixel_areas).astype(np.float32) # (T,)
-        original_areas = np.array(original_areas).astype(np.float32) # (T,)
-        original_counts = np.array(original_counts).astype(np.float32) # (T,)
 
         # Obtener T (usando day como referencia, asumiendo todos tienen mismo T)
         T = day_imgs.shape[0]
@@ -296,8 +272,6 @@ class TSDataset(Dataset):
             torch.from_numpy(labels),        # (T, H, W)
             torch.from_numpy(label_masks),   # (T, H, W)
             torch.from_numpy(pixel_areas),   # (T,)
-            torch.from_numpy(original_areas), # (T,)
-            torch.from_numpy(original_counts) # (T,)
         )
 
 
@@ -305,24 +279,20 @@ def collate_fn(batch):
     """
     Collate function simplificada para datos combinados.
     
-    Input por muestra: (combined, labels, label_masks, pixel_areas, original_areas, original_counts)
+    Input por muestra: (combined, labels, label_masks, pixel_areas)
     Output: dict con tensores paddeados
     """
-    combined_list, labels_list, label_masks_list, pixel_areas_list, original_areas_list, original_counts_list = zip(*batch)
+    combined_list, labels_list, label_masks_list, pixel_areas_list = zip(*batch)
 
     # Padding temporal: (B, T_max, C, H, W)
     combined_padded = pad_sequence(combined_list, batch_first=True, padding_value=0.0)
     labels_padded = pad_sequence(labels_list, batch_first=True, padding_value=0.0)
     label_masks_padded = pad_sequence(label_masks_list, batch_first=True, padding_value=0.0)
     pixel_areas_padded = pad_sequence(pixel_areas_list, batch_first=True, padding_value=0.0)
-    original_areas_padded = pad_sequence(original_areas_list, batch_first=True, padding_value=0.0)
-    original_counts_padded = pad_sequence(original_counts_list, batch_first=True, padding_value=0.0)
 
     return {
         'x': combined_padded,              # (B, T, C_total, H, W)
         'label': labels_padded,            # (B, T, H, W)
         'label_mask': label_masks_padded,  # (B, T, H, W)
         'pixel_area': pixel_areas_padded,  # (B, T)
-        'original_area': original_areas_padded, # (B, T)
-        'original_count': original_counts_padded # (B, T)
     }
