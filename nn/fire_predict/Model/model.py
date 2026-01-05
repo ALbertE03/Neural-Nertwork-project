@@ -124,8 +124,9 @@ class FirePredictModel(nn.Module):
         self.hidden_channels = hidden_channels
         self.input_channels = input_channels
         
-        # Encoder: 1 capa ConvLSTM (Reducido de 2 para ahorrar memoria)
+        # Encoder: 2 capas ConvLSTM
         self.encoder1 = ConvLSTMCell(input_channels, hidden_channels, use_bn=True)
+        self.encoder2 = ConvLSTMCell(hidden_channels, hidden_channels, use_bn=True)
         
         self.dropout = nn.Dropout2d(dropout)
         
@@ -158,25 +159,34 @@ class FirePredictModel(nn.Module):
         
         # Inicializar hidden states
         state1 = self.encoder1.init_hidden(B, H, W, device)
+        state2 = self.encoder2.init_hidden(B, H, W, device)
         
         # Procesar secuencia histórica y guardar estados
         historical_states = []
         for t in range(T):
+            # Layer 1
             h1, c1 = self.encoder1(x[:, t], state1)
-            h1 = self.dropout(h1)
-            state1 = (h1, c1)
+            state1 = (h1, c1) # para el siguiente paso temporal (t+1)
             
-            historical_states.append(h1)
+            h1_drop = self.dropout(h1) 
+            
+            # Layer 2
+            h2, c2 = self.encoder2(h1_drop, state2)
+            state2 = (h2, c2) 
+            
+            h2_drop = self.dropout(h2) 
+            
+            historical_states.append(h2_drop)
         
         # Stack historical states: (B, T, C, H, W)
         historical_states = torch.stack(historical_states, dim=1)
                 
         # Aplicar attention: estado actual consulta a todos los estados históricos
-        # h1 es el último estado
-        h1_attended = self.attention(h1, historical_states)  # (B, C, H, W)
+        # h2 es el último estado
+        h2_attended = self.attention(h2, historical_states)  # (B, C, H, W)
         
         # Combinar estado actual + contexto atendido
-        combined = torch.cat([h1, h1_attended], dim=1)  # (B, 2*C, H, W)
+        combined = torch.cat([h2, h2_attended], dim=1)  # (B, 2*C, H, W)
         
         # Decodificar predicción
         pred_logits = self.decoder(combined)  # (B, 1, H, W)

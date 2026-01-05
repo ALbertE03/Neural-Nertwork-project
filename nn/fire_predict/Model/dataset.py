@@ -7,6 +7,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from rasterio import Affine
 from rasterio.warp import reproject, Resampling
+from constants import MAX_INPUT_SEQ_LEN, PRED_SEQ_LEN
 
 class TSDataset(Dataset):
     def __init__(self, path_valid, shapes):
@@ -216,10 +217,23 @@ class TSDataset(Dataset):
 
     def __getitem__(self, idx):
         paths = self.image_paths[idx+1]
-        seq_day, t_day, crs_day = self.open_tif(paths['VIIRS_Day'])
-        seq_night, t_night, crs_night = self.open_tif(paths['VIIRS_Night'])
-        seq_firepred, t_fire, crs_fire = self.open_tif(paths['FirePred'])
-        static_img, t_static, crs_static = self.open_tif(paths['ESRI_LULC'])
+        
+        needed_len = MAX_INPUT_SEQ_LEN + PRED_SEQ_LEN
+        
+        # Helper simple para coger los últimos N elementos
+        def get_last_n(l, n):
+            return l[-n:] if len(l) > n else l
+
+        # Seleccionar solo los archivos necesarios (últimos N)
+        day_paths = get_last_n(paths['VIIRS_Day'], needed_len)
+        night_paths = get_last_n(paths['VIIRS_Night'], needed_len)
+        fire_paths = get_last_n(paths['FirePred'], needed_len)
+        static_paths = paths['ESRI_LULC']
+
+        seq_day, t_day, crs_day = self.open_tif(day_paths)
+        seq_night, t_night, crs_night = self.open_tif(night_paths)
+        seq_firepred, t_fire, crs_fire = self.open_tif(fire_paths)
+        static_img, t_static, crs_static = self.open_tif(static_paths)
 
         # Preprocesar con máscaras
         day_imgs, labels, label_masks, pixel_areas = self._preprocess(seq_day, t_day, crs_day, 

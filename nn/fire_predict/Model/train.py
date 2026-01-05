@@ -17,6 +17,8 @@ def train_epoch(model, loader, optimizer, scaler, device, pred_horizon=1, accum_
     """
     model.train()
     total_loss = 0
+    total_bce = 0
+    total_dice = 0
     total_samples = 0
     optimizer.zero_grad()
     pbar = tqdm(loader, desc="Training")
@@ -58,11 +60,20 @@ def train_epoch(model, loader, optimizer, scaler, device, pred_horizon=1, accum_
             optimizer.zero_grad()
         
         current_loss = loss.item() * accum_steps
+        current_bce = bce.item()
+        current_dice = dice.item()
+        
         total_loss += current_loss * B
+        total_bce += current_bce * B
+        total_dice += current_dice * B
         total_samples += B
         
         # Actualizar barra de progreso con el loss actual
-        pbar.set_postfix({'loss': f'{current_loss:.4f}'})
+        pbar.set_postfix({
+            'loss': f'{current_loss:.4f}',
+            'bce': f'{current_bce:.4f}',
+            'dice': f'{current_dice:.4f}'
+        })
     
     # Actualizar con gradientes restantes
     if (batch_idx + 1) % accum_steps != 0:
@@ -70,7 +81,11 @@ def train_epoch(model, loader, optimizer, scaler, device, pred_horizon=1, accum_
         scaler.update()
         optimizer.zero_grad()
     
-    return total_loss / max(total_samples, 1)
+    return (
+        total_loss / max(total_samples, 1),
+        total_bce / max(total_samples, 1),
+        total_dice / max(total_samples, 1)
+    )
 
 
 @torch.no_grad()
@@ -237,26 +252,29 @@ def main():
             history = []
     else:
         history = []
-    
+        
     for epoch in range(start_epoch, EPOCHS):
         print(f"Epoch {epoch+1}/{EPOCHS}")
-        train_loss = train_epoch(model, dataloader_train, optimizer, scaler, device, PRED_SEQ_LEN, ACCUM_STEPS)
+        train_loss, train_bce, train_dice = train_epoch(model, dataloader_train, optimizer, scaler, device, PRED_SEQ_LEN, ACCUM_STEPS)
         val_loss, val_iou, val_f1, val_prec, val_rec, val_area_err = validate(model, dataloader_val, device, PRED_SEQ_LEN)
         
         scheduler.step(val_iou)
         
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val IoU: {val_iou:.4f} | F1: {val_f1:.4f} | Prec: {val_prec:.4f} | Rec: {val_rec:.4f} | Area Err: {val_area_err:.2e}")
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {train_loss:.4f} (BCE: {train_bce:.4f}, Dice: {train_dice:.4f}) | Val Loss: {val_loss:.4f} | Val IoU: {val_iou:.4f} | F1: {val_f1:.4f} | Prec: {val_prec:.4f} | Rec: {val_rec:.4f} | Area Err: {val_area_err:.2e}")
         
         # Guardar métricas en historial
         epoch_metrics = {
             'epoch': epoch + 1,
             'train_loss': train_loss,
+            'train_bce': train_bce,
+            'train_dice': train_dice,
             'val_loss': val_loss,
             'val_iou': val_iou,
             'val_f1': val_f1,
             'val_precision': val_prec,
             'val_recall': val_rec,
-            'val_area_error': val_area_err
+            'val_area_error': val_area_err,
+    
         }
         history.append(epoch_metrics)
         with open(history_file, 'w') as f:
