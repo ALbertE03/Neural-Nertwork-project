@@ -59,7 +59,7 @@ def precision_score(pred, target, mask=None, threshold=0.5):
     fp = (pred_bin * (1 - target_flat)).sum()
     
     if tp + fp == 0:
-        return 0.0
+        return 1.0
         
     return (tp / (tp + fp)).item()
 
@@ -78,7 +78,7 @@ def recall_score(pred, target, mask=None, threshold=0.5):
     fn = ((1 - pred_bin) * target_flat).sum()
     
     if tp + fn == 0:
-        return 0.0
+        return 1.0
         
     return (tp / (tp + fn)).item()
 
@@ -155,7 +155,7 @@ def centroid_distance_error(pred, target, pixel_area, mask=None, threshold=0.5):
     valid_mask = (pred_mass > 0) & (target_mass > 0)
     
     if not valid_mask.any():
-        return 0.0
+        return 0.0, 0
         
     # Calcular centroides (B, T)
     pred_cy = (pred_bin * y_coords).sum(dim=(-2, -1)) / (pred_mass + 1e-8)
@@ -213,10 +213,9 @@ def physical_area_consistency(mask_proj, pixel_area_proj, area_orig, threshold=0
         'area_proj': area_proj.mean().item()
     }
 
-def cluster_count_diff(pred, target_count, mask=None, threshold=0.5):
+def cluster_count_error(pred, target_count, mask=None, threshold=0.5):
     """
-    Calcula la diferencia en el número de focos de incendio (clusters).
-    Útil para detectar si la reproyección está fusionando o eliminando focos aislados.
+    Calcula el error absoluto medio en el número de focos de incendio (clusters).
     
     Args:
         pred: (B, H, W) - Probabilidades o logits
@@ -224,8 +223,7 @@ def cluster_count_diff(pred, target_count, mask=None, threshold=0.5):
         mask: (B, H, W) - Máscara de validez
         
     Returns:
-        diff_mean: Promedio de (Pred_Clusters - Orig_Clusters)
-                   Negativo = Pérdida de focos (fusión o desaparición)
+        mae: Promedio de |Pred_Clusters - Orig_Clusters|
     """
     pred_bin = (pred > threshold).float()
     if mask is not None:
@@ -245,6 +243,6 @@ def cluster_count_diff(pred, target_count, mask=None, threshold=0.5):
         n_clusters_orig = target_count[i].item()
         diffs.append(n_clusters_pred - n_clusters_orig)
         
-    return np.mean(diffs)
+    return np.mean(np.abs(diffs))
 
 
