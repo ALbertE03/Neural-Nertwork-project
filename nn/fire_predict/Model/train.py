@@ -8,159 +8,91 @@ import json
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
-from model import FirePredictModel
-from dataset import TSDataset, collate_fn
-from constants import *
+from constants import EPOCHS, LEARNING_RATE, PRED_SEQ_LEN, ACCUM_STEPS
+from model import UNet3D
 import numpy as np
-from sklearn.metrics import precision_score, recall_score, f1_score, jaccard_score, confusion_matrix
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.8, gamma=2, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha  # Peso para la clase minoritaria (fuego)
-        self.gamma = gamma  # Factor de enfoque
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        # inputs: Logits (B, 1, H, W)
-        # targets: (B, 1, H, W)
-        
-        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        pt = torch.exp(-bce_loss)  # probabilidad de la clase correcta
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
-
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
-
-class TverskyLoss(nn.Module):
-    def __init__(self, alpha=0.3, beta=0.7, smooth=1.0):
-        # alpha: penalización FP
-        # beta: penalización FN (Queremos beta alto para priorizar Recall)
+class DiceFocalLoss(nn.Module):
+    def __init__(self, alpha=0.9, gamma=2.0, dice_weight=0.5):
         super().__init__()
         self.alpha = alpha
-        self.beta = beta
-        self.smooth = smooth
+        self.gamma = gamma
+        self.dice_weight = dice_weight
 
-    def forward(self, logits, targets):
-        probs = torch.sigmoid(logits)
+    def forward(self, inputs, targets):
+        probs = torch.sigmoid(inputs)
         
-        probs_flat = probs.reshape(-1)
-        targets_flat = targets.reshape(-1)
-        
-        # True Positives, False Positives, False Negatives
-        TP = (probs_flat * targets_flat).sum()
-        FP = ((1 - targets_flat) * probs_flat).sum()
-        FN = (targets_flat * (1 - probs_flat)).sum()
-        
-        tversky_index = (TP + self.smooth) / (TP + self.alpha * FP + self.beta * FN + self.smooth)
-        
-        return 1 - tversky_index
+        # Focal Loss (píxel a píxel)
+        ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt)**self.gamma * ce_loss
+        focal_loss = focal_loss.mean()
 
-def train_epoch(model, loader, optimizer, scaler, device, pos_weight=None, pred_horizon=1, accum_steps=4):
-    """
-    Entrena el modelo para clasificación BINARIA (Fire vs Non-Fire).
-    """
+        # Dice Loss (Global/Estructural)
+        smooth = 1e-5
+        intersection = (probs * targets).sum()
+        dice_loss = 1 - (2. * intersection + smooth) / (probs.sum() + targets.sum() + smooth)
+
+        return (focal_loss * (1 - self.dice_weight)) + (dice_loss * self.dice_weight)
+
+
+
+def train_epoch(model, loader, optimizer, scaler, device,criterion, pred_horizon=1, accum_steps=4):
     model.train()
     total_loss = 0
     total_correct = 0
     total_pixels = 0
     
-    # Combined Loss: Focal (Hard examples) + Tversky (Recall oriented)
-    # Focal parameters: alpha alto para dar importancia a clase 1
-    focal_criterion = FocalLoss(alpha=0.75, gamma=2).to(device) 
-    # Tversky parameters: beta > alpha para castigar más los falsos negativos
-    tversky_criterion = TverskyLoss(alpha=0.3, beta=0.7).to(device)
     
     optimizer.zero_grad()
     pbar = tqdm(loader, desc="Training")
     
     for batch_idx, batch in enumerate(pbar):
-        x = batch['x'].to(device)                # (B, T, C_total, H, W)
+        x = batch['x'].to(device)                # (B, T, C, H, W)
         labels = batch['label'].float().to(device) # (B, T, H, W) 
         
-        # Input: sequence until T-1
+        # La U-Net 3D espera la secuencia completa o N-1 para predecir el último
         input_seq = x[:, :-pred_horizon]  # (B, T-1, C, H, W)
         
-        # Target: last day
-        # Ensure target is (B, 1, H, W) for BCE
+        # Target: El último frame de la secuencia de etiquetas
         target = labels[:, -1].unsqueeze(1) # (B, 1, H, W)
         
-        # Binarize target for Loss rigorously (soft labels -> 0 or 1)
-        target_bin = (target > FIRE_THRESHOLDS[0]).float()
-
-        # Forward
         with torch.amp.autocast(device_type='cuda', enabled=(device.type == 'cuda')):
-            # pred: (B, 1, H, W) logits
-            pred_logits = model(input_seq)
+            # Forward: UNet3D internamente hará el permute a (B, C, T, H, W)
+            pred_logits = model(input_seq) # Salida esperada: (B, 1, H, W)
             
-            # Loss = Focal + Tversky
-            loss_focal = focal_criterion(pred_logits, target_bin)
-            loss_tversky = tversky_criterion(pred_logits, target_bin)
-            
-            loss = (loss_focal + loss_tversky) / accum_steps
+            # Cálculo de pérdida unificado
+            loss = criterion(pred_logits, target) / accum_steps
 
-        # Backward
         scaler.scale(loss).backward()
         
         if (batch_idx + 1) % accum_steps == 0:
-            # Gradient Clipping para estabilizar LSTM/RNN
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
         
-        current_loss = loss.item() * accum_steps
-        
-        # Accuracy estimativa (Threshold from constants on sigmoid)
+        # Métricas de visualización
         with torch.no_grad():
-            preds = (torch.sigmoid(pred_logits) > FIRE_THRESHOLDS[0]).float()
-            target_bin = (target > FIRE_THRESHOLDS[0]).float()
-            correct = (preds == target_bin).sum().item()
-            pixels = target.numel()
-            
-            total_loss += current_loss * x.size(0)
+            probs = torch.sigmoid(pred_logits)
+            preds = (probs > 0.5).float()
+            correct = (preds == target).sum().item()
             total_correct += correct
-            total_pixels += pixels
+            total_pixels += target.numel()
+            total_loss += loss.item() * accum_steps
             
-            acc = correct / max(pixels, 1)
+        pbar.set_postfix({'loss': f'{loss.item()*accum_steps:.4f}', 'acc': f'{correct/target.numel():.4f}'})
 
-        pbar.set_postfix({'loss': f'{current_loss:.4f}', 'acc': f'{acc:.4f}'})
-    
-    if (batch_idx + 1) % accum_steps != 0:
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad()
-    
-    avg_loss = total_loss / max(len(loader.dataset), 1)
-    avg_acc = total_correct / max(total_pixels, 1)
-    
-    return avg_loss, avg_acc, 0.0
+    return total_loss / len(loader), total_correct / total_pixels, 0.0
+
 
 
 @torch.no_grad()
-def validate(model, loader, device, pred_horizon=1, epoch=None, pos_weight=None):
-    """
-    Evalúa clasificación BINARIA usando sklearn metrics.
-    """
+def validate(model, loader, device,criterion, pred_horizon=1):
     model.eval()
     total_loss = 0
-    total_samples = 0
+    tp, fp, fn, tn = 0, 0, 0, 0
     
-    # Validation uses consistent Combined Loss for reporting
-    focal_criterion = FocalLoss(alpha=0.75, gamma=2).to(device)
-    tversky_criterion = TverskyLoss(alpha=0.3, beta=0.7).to(device)
-    
-    # Store all preds and targets for sklearn robust metrics (on CPU)
-    # Acumulamos en listas para concatenar al final
-    all_preds = []
-    all_targets = []
-
     pbar = tqdm(loader, desc="Validation")
     
     for batch in pbar:
@@ -168,73 +100,32 @@ def validate(model, loader, device, pred_horizon=1, epoch=None, pos_weight=None)
         labels = batch['label'].float().to(device)
         
         input_seq = x[:, :-pred_horizon]
-        target = labels[:, -1].unsqueeze(1) # (B, 1, H, W)
-        target_bin = (target > FIRE_THRESHOLDS[0]).float()
+        target = labels[:, -1].unsqueeze(1)
         
         with torch.amp.autocast(device_type='cuda', enabled=(device.type == 'cuda')):
             pred_logits = model(input_seq)
+            loss = criterion(pred_logits, target)
             
-            # Loss combined
-            loss_focal = focal_criterion(pred_logits, target_bin)
-            loss_tversky = tversky_criterion(pred_logits, target_bin)
-            loss = loss_focal + loss_tversky
-            
-        total_loss += loss.item() * x.size(0)
-        total_samples += x.size(0)
+        total_loss += loss.item()
         
-        # Binarize Predictions
         probs = torch.sigmoid(pred_logits)
-        preds = (probs > FIRE_THRESHOLDS[0]).long().cpu().numpy().flatten()
-        targets = (target > FIRE_THRESHOLDS[0]).long().cpu().numpy().flatten()
+        preds = (probs > 0.3).float() # Puedes ajustar este umbral a 0.3 si el fuego es muy escaso
         
-        all_preds.extend(preds)
-        all_targets.extend(targets)
+        tp += (preds * target).sum().item()
+        fp += (preds * (1 - target)).sum().item()
+        fn += ((1 - preds) * target).sum().item()
+        tn += ((1 - preds) * (1 - target)).sum().item()
 
-    all_preds = np.array(all_preds)
-    all_targets = np.array(all_targets)
+    # Cálculo de métricas
+    epsilon = 1e-7
+    precision = tp / (tp + fp + epsilon)
+    recall = tp / (tp + fn + epsilon)
+    f1 = 2 * (precision * recall) / (precision + recall + epsilon)
+    iou_fire = tp / (tp + fp + fn + epsilon)
+    accuracy = (tp + tn) / (tp + tn + fp + fn + epsilon)
 
-    # Calcular Métricas con Sklearn
-    precision = precision_score(all_targets, all_preds, zero_division=0)
-    recall = recall_score(all_targets, all_preds, zero_division=0)
-    f1 = f1_score(all_targets, all_preds, zero_division=0)
-    iou = jaccard_score(all_targets, all_preds, zero_division=0)
-    cm = confusion_matrix(all_targets, all_preds)
-    
-    # Accuracy manual 
-    accuracy = (all_preds == all_targets).mean()
-    
-    # Confusion Matrix unpacking
-    # [[TN, FP], [FN, TP]]
-    tn, fp, fn, tp = cm.ravel()
-    
-    print(f"\n--- Validation Results (Binary: Fire vs No-Fire) ---")
-    print(f"Global Accuracy: {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print(f"IoU (Intersection over Union): {iou:.4f}")
-    print("Confusion Matrix:")
-    print(cm)
-    
-    # --- Plotting ---
-    if epoch is not None:
-        try:
-            class_names = ['No Fire', 'Fire']
-            plt.figure(figsize=(6, 5))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                        xticklabels=class_names, yticklabels=class_names)
-            plt.title(f'Binary Confusion Matrix - Epoch {epoch+1}')
-            plt.xlabel('Predicted')
-            plt.ylabel('True')
-            plt.tight_layout()
-            plt.pause(0.1)
-        except Exception as e:
-            print(f"Error plotting matrices: {e}")
-            
-    avg_loss = total_loss / max(total_samples, 1)
-    
-    return avg_loss, accuracy, f1, iou
-
+    print(f"\nVal F1: {f1:.4f} | IoU Fire: {iou_fire:.4f} | Acc: {accuracy:.4f}")
+    return total_loss / len(loader), accuracy, f1, iou_fire
 
 CHECKPOINT_DIR = 'saved/checkpoints'
 
@@ -286,69 +177,18 @@ def load_checkpoint(model, optimizer, scheduler):
         return 0, 0
 
 
-def calculate_pos_weight(loader):
-    """Calcular peso para la clase positiva (fuego) para contrarrestar desbalanceo."""
-    print("Calculando peso para clase positiva (muestreando dataset)...")
-    total_pixels_fire = 0
-    total_pixels_bg = 0
-    limit = max(1, len(loader) // 5) # Sample 20%
-    
-    for i, batch in enumerate(loader):
-        if i >= limit: break
-        # Binarize labels using defined threshold to capture soft labels
-        labels = (batch['label'] > FIRE_THRESHOLDS[0]).long() # (B, T, H, W)
-        
-        # Count 1s and 0s
-        n_fire = (labels == 1).sum().item()
-        n_bg = (labels == 0).sum().item()
-        
-        total_pixels_fire += n_fire
-        total_pixels_bg += n_bg
-    
-    if total_pixels_fire == 0:
-        print("Warning: No fire found in sample. Using default pos_weight=1.0")
-        return torch.tensor([1.0])
-        
-    # pos_weight = Number of Negatives / Number of Positives
-    weight = total_pixels_bg / total_pixels_fire
-    
-    print(f"Found: {total_pixels_bg} background pixels, {total_pixels_fire} fire pixels.")
-    print(f"Calculated pos_weight: {weight:.2f}")
-    
-    return torch.tensor([weight])
-
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Usando dispositivo: {device}")
 
     plt.ion()
     
-    # 1. Dataset & Dataloader
-    if not DATA_PATHS:
-        print("Warning: DATA_PATHS está vacío. Usando ruta por defecto 'data/' si existe.")
-        paths_to_use = ['data/'] # Placeholder
-    else:
-        paths_to_use = DATA_PATHS
-        
-    full_dataset = TSDataset(paths_to_use, SHAPES)
-    
-    # Simple split
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
-    
-    dataloader_train = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    dataloader_val = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
     # Calcular Peso Positivo (Deprecated by Focal Loss, but keeping variable for signature compatibility if needed)
     pos_weight = None 
+    criterion = DiceFocalLoss(alpha=0.95, dice_weight=0.7).to(device)
     
-    model = FirePredictModel(
-        input_channels=INPUT_CHANNELS,  
-        hidden_channels=HIDDEN_CHANNELS,
-        dropout=DROPOUT,
-        num_classes=1 
-    ).to(device)
+    # Configuración del modelo
+    model = UNet3D(in_channels=28, out_channels=1).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -375,13 +215,13 @@ def main():
         print(f"Epoch {epoch+1}/{EPOCHS}")
         
         train_loss, train_acc, _ = train_epoch(model, dataloader_train, optimizer, scaler, device, 
-                                               pos_weight=pos_weight, # Pass binary weight
+                                               criterion,
                                                pred_horizon=PRED_SEQ_LEN, accum_steps=ACCUM_STEPS)
-        val_loss, val_acc, val_f1, val_iou = validate(model, dataloader_val, device, PRED_SEQ_LEN, epoch=epoch, pos_weight=pos_weight)
+        val_loss, val_acc, val_f1, val_iou = validate(model, dataloader_val, device,criterion, pred_horizon=PRED_SEQ_LEN)
         
         scheduler.step(val_f1) # Optimize for F1 instead of Acc in imbalanced binary
         
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | F1: {val_f1:.4f} | IoU: {val_iou:.4f}")
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | F1: {val_f1:.4f} | Mean IoU: {val_iou:.4f}")
         
         # Guardar métricas en historial
         epoch_metrics = {
@@ -391,7 +231,7 @@ def main():
             'val_loss': val_loss,
             'val_acc': val_acc,
             'val_f1': val_f1,
-            'val_iou': val_iou,
+            'val_mean_iou': val_iou,
         }
         history.append(epoch_metrics)
         with open(history_file, 'w') as f:
