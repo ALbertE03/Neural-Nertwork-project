@@ -7,7 +7,8 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from rasterio import Affine
 from rasterio.warp import reproject, Resampling
-from constants import MAX_INPUT_SEQ_LEN, PRED_SEQ_LEN
+from constants import FIRE_THRESHOLDS, MAX_INPUT_SEQ_LEN, PRED_SEQ_LEN
+
 
 class TSDataset(Dataset):
     def __init__(self, path_valid, shapes):
@@ -250,7 +251,11 @@ class TSDataset(Dataset):
         night_imgs = np.array(night_imgs).astype(np.float32)  # (T, C_night, H, W)
         fire_imgs = np.array(fire_imgs).astype(np.float32)    # (T, C_fire, H, W)
         lulc_img = np.array(lulc_imgs[0]).astype(np.float32)  # (C_lulc, H, W)
-        labels = np.array(labels).astype(np.float32)          # (T, H, W)
+        
+        labels = np.array(labels) # (T, H, W)
+        # Discretizar labels en clases (Cualquier valor > 0 es incendio)
+        labels = (labels > 0).astype(np.int64)
+        
         label_masks = np.array(label_masks).astype(np.float32)
         pixel_areas = np.array(pixel_areas).astype(np.float32) # (T,)
 

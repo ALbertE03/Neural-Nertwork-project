@@ -3,7 +3,8 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 from model import FirePredictModel
-from utils import iou_score, f1_score, precision_score, recall_score, burned_area_error, dice_loss
+from utils import compute_multiclass_metrics
+from constants import FIRE_THRESHOLDS, NUM_CLASSES, UNDERESTIMATION_COST, OVERESTIMATION_COST
 
 def test_synthetic():
     print("Generando datos sintéticos para prueba...")
@@ -20,128 +21,93 @@ def test_synthetic():
     print(f"Usando dispositivo: {device}")
 
     # Crear datos aleatorios sintéticos
-    # Input X: (B, T, C, H, W) - Valores normalizados aprox 0-1
     x = torch.randn(B, T, C, H, W).to(device)
     
-    # Labels: (B, T, H, W) - Soft labels entre 0 y 1
-    # Generamos algunos "fuegos" aleatorios (valores altos)
-    labels = torch.zeros(B, T, H, W).to(device)
-    # Simular un fuego en una zona cuadrada
-    labels[:, :, 20:40, 20:40] = torch.rand(B, T, 20, 20).to(device) * 0.8 + 0.2 # Valores entre 0.2 y 1.0
+    # Labels: Necesitamos clases enteras 0, 1, 2, 3
+    # Generamos floats 0-1 y digitalizamos como en dataset.py
+    raw_labels = torch.zeros(B, T, H, W).float()
     
-    # Masks: (B, T, H, W) - 1 donde hay datos válidos
-    label_mask = torch.ones(B, T, H, W).to(device)
-    # Simular algunos datos faltantes
-    label_mask[:, :, 0:5, 0:5] = 0
+    # Simular evolución temporal:
+    # t=0: poco fuego, t=4: mucho fuego
+    for t in range(T):
+        intensity = 0.2 + (t / T) * 0.8 # Sube intensidad con el tiempo
+        raw_labels[:, t, 20:40, 20:40] = torch.rand(B, 20, 20) * intensity
     
-    # Pixel Area: (B, T) - Metros cuadrados por pixel (ej. 375x375 = ~140000)
-    pixel_area = torch.ones(B, T).to(device) * 140625.0
+    labels_np = raw_labels.numpy()
+    labels_discretized = np.digitize(labels_np, FIRE_THRESHOLDS).astype(np.int64)
+    labels = torch.from_numpy(labels_discretized).to(device)
 
     print(f"\nDimensiones de entrada: {x.shape}")
     print(f"Dimensiones de labels: {labels.shape}")
+    print(f"Clases únicas en labels: {torch.unique(labels)}")
 
     # Inicializar Modelo
     print("\nInicializando modelo...")
     model = FirePredictModel(
         input_channels=C,
-        hidden_channels=16,
-        dropout=0.1
+        hidden_channels=64,
+        dropout=0.1,
+        num_classes=NUM_CLASSES
     ).to(device)
-    
-    # Contar parámetros
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total de parámetros: {total_params:,}")
-    print(f"Parámetros entrenables: {trainable_params:,}")
     
     model.eval()
 
-
-    # Input: toda la secuencia menos el horizonte de predicción
+    # Input: secuencia hasta T-1
     input_seq = x[:, :-PRED_HORIZON] # (B, T-1, C, H, W)
     
-    # Target: el último día 
+    # Target Actual (T) y Anterior (T-1) para ver transiciones
     target = labels[:, -1]      # (B, H, W)
-    target_mask = label_mask[:, -1]
-    target_area = pixel_area[:, -1]
+    prev_target = labels[:, -2] # (B, H, W)
 
     print(f"Input Seq shape: {input_seq.shape}")
-    print(f"Target shape: {target.shape}")
 
     # 4. Forward Pass
     print("\nEjecutando Forward Pass...")
     with torch.no_grad():
-        # El modelo devuelve logits
-        logits = model(input_seq) # (B, H, W)
+        # El modelo devuelve logits (B, NumClasses, H, W)
+        logits = model(input_seq) 
         
-        # Convertir a probabilidades (Soft Output)
-        probs = torch.sigmoid(logits)
-
     print(f"Salida del modelo (Logits): {logits.shape}")
-    print(f"Salida del modelo (Probs):  {probs.shape}")
-    
-    # Visualizar algunos valores
-    print("\n--- Muestra de valores ---")
-    print(f"Max probabilidad predicha: {probs.max().item():.4f}")
-    print(f"Min probabilidad predicha: {probs.min().item():.4f}")
-    print(f"Promedio probabilidad:     {probs.mean().item():.4f}")
-    
-    # 5. Calcular Métricas (Soft)
-    print("\n--- Calculando Métricas Soft ---")
-    
-    # Loss (BCE)
-    bce = nn.functional.binary_cross_entropy_with_logits(logits, target, reduction='none')
-    bce_val = (bce * target_mask).sum() / (target_mask.sum() + 1e-8)
-    print(f"BCE Loss: {bce_val.item():.4f}")
-    
-    # Metrics
-    iou = iou_score(probs, target, target_mask)
-    f1 = f1_score(probs, target, target_mask)
-    prec = precision_score(probs, target, target_mask)
-    rec = recall_score(probs, target, target_mask)
-    area_err = burned_area_error(probs.unsqueeze(1), target.unsqueeze(1), target_area.unsqueeze(1), target_mask.unsqueeze(1))
 
-    print(f"Soft IoU:       {iou:.4f}")
-    print(f"Soft F1:        {f1:.4f}")
-    print(f"Soft Precision: {prec:.4f}")
-    print(f"Soft Recall:    {rec:.4f}")
-    print(f"Area Error:     {area_err:.2f} m^2")
-
-    # 6. Visualizar Resultados
-    print("\nGenerando imagen de prueba 'synthetic_output.png'...")
+    # 5. Calcular Métricas Multiclase
+    print("\n--- Calculando Métricas Multiclase ---")
     
-    # Tomar la primera muestra del batch
-    idx = 0
+    acc, f1, cm = compute_multiclass_metrics(logits, target, NUM_CLASSES)
     
-    # Convertir a numpy para plotear
-    target_np = target[idx].cpu().numpy()
-    pred_np = probs[idx].cpu().numpy()
+    print(f"Accuracy: {acc:.4f}")
+    print(f"Macro F1: {f1:.4f}")
+    print("Matriz de Confusión (Truth vs Pred):")
+    print(cm.numpy().astype(int))
     
-    # Crear figura
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    # 6. Calcular Matriz de Transición Temporal
+    # Queremos ver probabilidad P(Pred=j | PrevTruth=i)
+    # "Dado que ayer era clase i, ¿qué predijo el modelo hoy?"
+    pred_classes = torch.argmax(logits, dim=1) # (B, H, W)
     
-    # Plot Target
-    im0 = axes[0].imshow(target_np, cmap='inferno', vmin=0, vmax=1)
-    axes[0].set_title("Target (Realidad)")
-    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+    # Achatamos
+    prev_t_flat = prev_target.reshape(-1)
+    p_flat = pred_classes.reshape(-1)
     
-    # Plot Predicción
-    im1 = axes[1].imshow(pred_np, cmap='inferno', vmin=0, vmax=1)
-    axes[1].set_title("Predicción (Probabilidad)")
-    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+    idx_tm = prev_t_flat * NUM_CLASSES + p_flat
+    tm_counts = torch.bincount(idx_tm, minlength=NUM_CLASSES**2)
+    transition_matrix = tm_counts.view(NUM_CLASSES, NUM_CLASSES).float()
     
-    # Plot Diferencia
-    diff = np.abs(target_np - pred_np)
-    im2 = axes[2].imshow(diff, cmap='Reds', vmin=0, vmax=1)
-    axes[2].set_title("Error Absoluto (|Target - Pred|)")
-    plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+    # Normalizar por fila para tener probabilidades
+    # Row sum = Total pixels que ayer eran clase i
+    row_sums = transition_matrix.sum(dim=1, keepdim=True)
+    tm_probs = transition_matrix / (row_sums + 1e-8)
     
-    plt.tight_layout()
-    plt.savefig('synthetic_output.png')
-    print("✅ Imagen guardada: synthetic_output.png")
-
-    print("\n✅ Prueba completada. El código funciona sin errores de dimensión.")
-
+    print("\n--- Matriz de Transiciones Temporales (PrevTruth -> CurrPred) ---")
+    print("Filas: Verdad en T-1 (Ayer)")
+    print("Cols:  Predicción en T (Hoy)")
+    print(tm_probs.numpy())
+    
+    print("\nInterpretación:")
+    print("Elemento [i, j] es la probabilidad de que el modelo prediga clase 'j' hoy,")
+    print("dado que ayer la realidad era clase 'i'.")
+    print("Ejemplo: [0, 1] alto significa que el modelo tiende a predecir inicio de fuego.")
+    print("Ejemplo: [3, 3] alto significa que el modelo predice persistencia de fuego alto.")
 
 if __name__ == "__main__":
     test_synthetic()
+

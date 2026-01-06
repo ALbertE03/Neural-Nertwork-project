@@ -119,7 +119,7 @@ class FirePredictModel(nn.Module):
     Input: Secuencia temporal (B, T, C, H, W)
     Output: pred_horizon máscaras futuras (B, pred_horizon, H, W)
     """
-    def __init__(self, input_channels=10, hidden_channels=32, dropout=0.3):
+    def __init__(self, input_channels=10, hidden_channels=32, dropout=0.3, num_classes=1):
         super().__init__()
         self.hidden_channels = hidden_channels
         self.input_channels = input_channels
@@ -142,14 +142,14 @@ class FirePredictModel(nn.Module):
             nn.Conv2d(hidden_channels, hidden_channels // 2, 3, padding=1),
             nn.BatchNorm2d(hidden_channels // 2),
             nn.ReLU(),
-            nn.Conv2d(hidden_channels // 2, 1, 1),  # 1 canal = 1 día
+            nn.Conv2d(hidden_channels // 2, num_classes, 1),  # num_classes output channels
         )
     def forward(self, x):
         """
         Args:
             x: (B, T, C, H, W) - secuencia temporal histórica
         Returns:
-            pred: (B, H, W) - predicción día+1
+            pred: (B, NumClasses, H, W) - logits día+1
             
         Estrategia:
         - Predice un solo día después usando la secuencia histórica.
@@ -189,6 +189,6 @@ class FirePredictModel(nn.Module):
         combined = torch.cat([h2, h2_attended], dim=1)  # (B, 2*C, H, W)
         
         # Decodificar predicción
-        pred_logits = self.decoder(combined)  # (B, 1, H, W)
+        pred_logits = self.decoder(combined)  # (B, num_classes, H, W)
         
-        return pred_logits.squeeze(1)  # (B, H, W)
+        return pred_logits
