@@ -7,14 +7,64 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from rasterio import Affine
 from rasterio.warp import reproject, Resampling
-from constants import FIRE_THRESHOLDS, MAX_INPUT_SEQ_LEN, PRED_SEQ_LEN
 
 
 class TSDataset(Dataset):
-    def __init__(self, path_valid, shapes):
+    def __init__(self, path_valid, shapes, train=False, augment=False, cache_dir=None):
         self.total = 0
+        self.train = train
+        self.augment = augment
         self.image_paths = self._find_tiff_files(path_valid)
         self.shapes = shapes
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _apply_augmentation(self, combined, labels, label_masks):
+        """
+        Aplica aumentaciones espaciales y ruido Gaussiano de forma consistente 
+        a través de toda la secuencia temporal.
+        """
+        # combined: (T, C, H, W)
+        # labels: (T, H, W)
+        # label_masks: (T, H, W)
+        
+        # 1. Aumentaciones Espaciales (Flips y Rotaciones)
+        if np.random.random() > 0.5:
+            # Elegir aleatoriamente una transformación
+            aug_type = np.random.choice(['flip_h', 'flip_v', 'rot90', 'rot180', 'rot270'])
+            
+            if aug_type == 'flip_h':
+                combined = torch.flip(combined, dims=[-1])
+                labels = torch.flip(labels, dims=[-1])
+                label_masks = torch.flip(label_masks, dims=[-1])
+            elif aug_type == 'flip_v':
+                combined = torch.flip(combined, dims=[-2])
+                labels = torch.flip(labels, dims=[-2])
+                label_masks = torch.flip(label_masks, dims=[-2])
+            elif aug_type == 'rot90':
+                combined = torch.rot90(combined, k=1, dims=[-2, -1])
+                labels = torch.rot90(labels, k=1, dims=[-2, -1])
+                label_masks = torch.rot90(label_masks, k=1, dims=[-2, -1])
+            elif aug_type == 'rot180':
+                combined = torch.rot90(combined, k=2, dims=[-2, -1])
+                labels = torch.rot90(labels, k=2, dims=[-2, -1])
+                label_masks = torch.rot90(label_masks, k=2, dims=[-2, -1])
+            elif aug_type == 'rot270':
+                combined = torch.rot90(combined, k=3, dims=[-2, -1])
+                labels = torch.rot90(labels, k=3, dims=[-2, -1])
+                label_masks = torch.rot90(label_masks, k=3, dims=[-2, -1])
+
+        # 2. Ruido Gaussiano (solo en los canales de entrada 'combined')
+        # Aplicamos ruido pequeño para robustez
+        if np.random.random() > 0.5:
+            noise = torch.randn_like(combined) * 0.01 
+            combined = combined + noise
+            # Opcional: clip para mantener rango [0, 1] si los datos están normalizados
+            combined = torch.clamp(combined, 0.0, 1.0)
+            
+        return combined, labels, label_masks
 
     def _find_tiff_files(self, paths):
         r = {}
@@ -156,9 +206,7 @@ class TSDataset(Dataset):
                     target_shape=target_shape, resampling=Resampling.bilinear
                 )  # (C-2, 256, 256)
 
-                # Calcular área del píxel nuevo
-                area = abs(new_transform.a * new_transform.e)
-                pixel_areas.append(area)
+               
                 
                 # Procesar LABEL (Fire) con AVERAGE para soft labels
                 fire_resized, _ = self._resize_rasterio(
@@ -212,16 +260,41 @@ class TSDataset(Dataset):
     
         if is_day:
             label_imgs, label_masks = zip(*labels) if labels else ([], [])
-            return news_imgs, list(label_imgs), list(label_masks), pixel_areas
+            return news_imgs, list(label_imgs), list(label_masks)
         else:
             return news_imgs
 
     def __getitem__(self, idx):
+        # Intentar cargar de caché primero
+        cache_file = None
+        if self.cache_dir:
+            # Crear un nombre único para el sample basado en su índice y configuración
+            cache_name = f"sample_{idx}_{self.shapes[0]}x{self.shapes[1]}.pt"
+            cache_file = self.cache_dir / cache_name
+            
+            if cache_file.exists():
+                try:
+                    data = torch.load(cache_file)
+                    combined_tensor = data['combined']
+                    labels_tensor = data['labels']
+                    masks_tensor = data['masks']
+                   
+                    
+                    # Aplicar aumentación si es necesario (la aumentación NO se cachea)
+                    if self.train and self.augment:
+                        combined_tensor, labels_tensor, masks_tensor = self._apply_augmentation(
+                            combined_tensor, labels_tensor, masks_tensor
+                        )
+                    return combined_tensor, labels_tensor, masks_tensor, 
+                except Exception as e:
+                    print(f"Error cargando caché {cache_file}: {e}")
+
+        # Si no hay caché o falló, procesar normalmente
         paths = self.image_paths[idx+1]
         
         needed_len = MAX_INPUT_SEQ_LEN + PRED_SEQ_LEN
         
-        # Helper simple para coger los últimos N elementos
+        # Helper para coger los últimos N elementos
         def get_last_n(l, n):
             return l[-n:] if len(l) > n else l
 
@@ -236,8 +309,8 @@ class TSDataset(Dataset):
         seq_firepred, t_fire, crs_fire = self.open_tif(fire_paths)
         static_img, t_static, crs_static = self.open_tif(static_paths)
 
-        # Preprocesar con máscaras
-        day_imgs, labels, label_masks, pixel_areas = self._preprocess(seq_day, t_day, crs_day, 
+        # Preprocesar con máquinas
+        day_imgs, labels, label_masks = self._preprocess(seq_day, t_day, crs_day, 
                                                                    is_day=True, target_shape=self.shapes)
         night_imgs = self._preprocess(seq_night, t_night, crs_night, 
                                                   is_night=True, target_shape=self.shapes)
@@ -253,15 +326,14 @@ class TSDataset(Dataset):
         lulc_img = np.array(lulc_imgs[0]).astype(np.float32)  # (C_lulc, H, W)
         
         labels = np.array(labels) # (T, H, W)
-        # Discretizar labels en clases (Cualquier valor > 0 es incendio)
-        labels = (labels > 0).astype(np.int64)
+        # Discretizar labels en clases (Cualquier valor > 0 es incendio) -> Estrictamente 1 o 0
+        labels = (labels > 0.0).astype(np.float32)
         
         label_masks = np.array(label_masks).astype(np.float32)
-        pixel_areas = np.array(pixel_areas).astype(np.float32) # (T,)
+     
 
         # Obtener T (usando day como referencia, asumiendo todos tienen mismo T)
         T = day_imgs.shape[0]
-        H, W = day_imgs.shape[-2], day_imgs.shape[-1]
         
         # Ajustar night y fire al mismo T que day (truncar o padear)
         if night_imgs.shape[0] != T:
@@ -286,12 +358,34 @@ class TSDataset(Dataset):
         combined = np.concatenate([day_imgs, night_imgs, fire_imgs, lulc_expanded], axis=1)
 
         # To tensor
+        combined_tensor = torch.from_numpy(combined)
+        labels_tensor = torch.from_numpy(labels)
+        masks_tensor = torch.from_numpy(label_masks)
+
+        # Guardar en caché antes de aumentación
+        if cache_file:
+            try:
+                
+                torch.save({
+                    'combined': combined_tensor,
+                    'labels': labels_tensor,
+                    'masks': masks_tensor,
+                }, cache_file)
+                print(f"guardado -> {cache_file}")
+            except Exception as e:
+                print(f"Error guardando caché {cache_file}: {e}")
+
+        # Aplicar aumentación si está en modo entrenamiento y activado
+        if self.train and self.augment:
+            combined_tensor, labels_tensor, masks_tensor = self._apply_augmentation(
+                combined_tensor, labels_tensor, masks_tensor
+            )
+
         return (
-            torch.from_numpy(combined),      # (T, C_total, H, W)
-            torch.from_numpy(labels),        # (T, H, W)
-            torch.from_numpy(label_masks),   # (T, H, W)
-            torch.from_numpy(pixel_areas),   # (T,)
-        )
+            combined_tensor,      # (T, C_total, H, W)
+            labels_tensor,        # (T, H, W)
+            masks_tensor,         # (T, H, W)
+             )
 
 
 def collate_fn(batch):
@@ -301,17 +395,16 @@ def collate_fn(batch):
     Input por muestra: (combined, labels, label_masks, pixel_areas)
     Output: dict con tensores paddeados
     """
-    combined_list, labels_list, label_masks_list, pixel_areas_list = zip(*batch)
+
+    combined_list, labels_list, label_masks_list = zip(*batch)
 
     # Padding temporal: (B, T_max, C, H, W)
     combined_padded = pad_sequence(combined_list, batch_first=True, padding_value=0.0)
     labels_padded = pad_sequence(labels_list, batch_first=True, padding_value=0.0)
     label_masks_padded = pad_sequence(label_masks_list, batch_first=True, padding_value=0.0)
-    pixel_areas_padded = pad_sequence(pixel_areas_list, batch_first=True, padding_value=0.0)
 
     return {
         'x': combined_padded,              # (B, T, C_total, H, W)
         'label': labels_padded,            # (B, T, H, W)
         'label_mask': label_masks_padded,  # (B, T, H, W)
-        'pixel_area': pixel_areas_padded,  # (B, T)
     }

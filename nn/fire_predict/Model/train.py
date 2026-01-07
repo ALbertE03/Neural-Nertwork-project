@@ -1,254 +1,180 @@
+import matplotlib.pyplot as plt
+import torch
+import numpy as np # Para convertir a numpy para matplotlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from pathlib import Path
-import os
-import json
 import matplotlib.pyplot as plt
-import seaborn as sns
 from tqdm import tqdm
-from constants import EPOCHS, LEARNING_RATE, PRED_SEQ_LEN, ACCUM_STEPS
-from model import UNet3D
-import numpy as np
-class DiceFocalLoss(nn.Module):
-    def __init__(self, alpha=0.9, gamma=2.0, dice_weight=0.5):
+
+def gaussian_blur(target, kernel_size=5, sigma=1.0):
+    """Crea una zona de probabilidad alrededor del píxel de fuego."""
+    # Forzamos a que sea 4D: [Batch, Channel, H, W]
+    if target.dim() == 2: # [256, 256] -> [1, 1, 256, 256]
+        target = target.unsqueeze(0).unsqueeze(0)
+    elif target.dim() == 3: # [C, H, W] -> [1, C, H, W]
+        target = target.unsqueeze(0)
+    
+    coords = torch.arange(kernel_size).float() - (kernel_size - 1) / 2
+    g = torch.exp(-(coords**2) / (2 * sigma**2))
+    g = g / g.sum()
+    kernel_2d = g[:, None] * g[None, :]
+    
+    # El kernel debe tener forma: [out_channels, in_channels, kH, kW]
+    kernel_4d = kernel_2d.expand(target.shape[1], 1, kernel_size, kernel_size).to(target.device)
+    
+    return F.conv2d(target, kernel_4d, padding=kernel_size//2)
+def calculate_metrics_zone(preds, targets, threshold=0.5, tolerance_px=3):
+    """
+    Calcula métricas considerando que acertar cerca del fuego es un acierto (TP).
+    """
+    preds_bin = (preds > threshold).float()
+    
+    # Dilatamos el target: si el fuego real está a 'tolerance_px', se considera zona de impacto
+    kernel_size = 2 * tolerance_px + 1
+    target_zone = F.max_pool2d(targets, kernel_size=kernel_size, stride=1, padding=tolerance_px)
+    
+    tp = (preds_bin * target_zone).sum()
+    fp = (preds_bin * (1 - target_zone)).sum()
+    # El recall se mide sobre el target original para ser estrictos
+    fn = ((1 - preds_bin) * targets).sum() 
+    
+    return tp, fp, fn
+class SoftZoneLoss(nn.Module):
+    def __init__(self, alpha=0.9, gamma=2.0, dice_weight=0.8):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.dice_weight = dice_weight
 
-    def forward(self, inputs, targets):
-        probs = torch.sigmoid(inputs)
+    def forward(self, logits, soft_targets):
+        probs = torch.sigmoid(logits)
         
-        # Focal Loss (píxel a píxel)
-        ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt)**self.gamma * ce_loss
-        focal_loss = focal_loss.mean()
+        # Focal Loss para targets continuos
+        pos_weight = torch.tensor([self.alpha / (1 - self.alpha)]).to(logits.device)
+        bce = F.binary_cross_entropy_with_logits(logits, soft_targets, pos_weight=pos_weight, reduction='none')
+        
+        # pt es la cercanía al target; si el target es 0.8, queremos que la prob sea 0.8
+        pt = torch.where(soft_targets > 0.5, probs, 1 - probs)
+        focal_loss = ((1 - pt) ** self.gamma * bce).mean()
 
-        # Dice Loss (Global/Estructural)
-        smooth = 1e-5
-        intersection = (probs * targets).sum()
-        dice_loss = 1 - (2. * intersection + smooth) / (probs.sum() + targets.sum() + smooth)
+        # Soft Dice Loss (comparación de áreas)
+        intersection = (probs * soft_targets).sum()
+        dice_loss = 1 - (2. * intersection + 1e-6) / (probs.sum() + soft_targets.sum() + 1e-6)
 
-        return (focal_loss * (1 - self.dice_weight)) + (dice_loss * self.dice_weight)
-
-
-
-def train_epoch(model, loader, optimizer, scaler, device,criterion, pred_horizon=1, accum_steps=4):
+        return (1 - self.dice_weight) * focal_loss + self.dice_weight * dice_loss
+    
+def train_epoch(model, loader, optimizer, scaler, device,
+                criterion, pred_horizon=1, accum_steps=1):
     model.train()
-    total_loss = 0
-    total_correct = 0
-    total_pixels = 0
-    
-    
-    optimizer.zero_grad()
+    total_loss = 0.0
     pbar = tqdm(loader, desc="Training")
-    
+    optimizer.zero_grad()
+
     for batch_idx, batch in enumerate(pbar):
-        x = batch['x'].to(device)                # (B, T, C, H, W)
-        labels = batch['label'].float().to(device) # (B, T, H, W) 
+        x = batch['x'].to(device)
+        targets = batch['label'].float().to(device)
         
-        # La U-Net 3D espera la secuencia completa o N-1 para predecir el último
-        input_seq = x[:, :-pred_horizon]  # (B, T-1, C, H, W)
+        input_seq = x[:, :-pred_horizon]
+        target_bin = targets[:, -1].unsqueeze(1) 
         
-        # Target: El último frame de la secuencia de etiquetas
-        target = labels[:, -1].unsqueeze(1) # (B, 1, H, W)
-        
-        with torch.amp.autocast(device_type='cuda', enabled=(device.type == 'cuda')):
-            # Forward: UNet3D internamente hará el permute a (B, C, T, H, W)
-            pred_logits = model(input_seq) # Salida esperada: (B, 1, H, W)
-            
-            # Cálculo de pérdida unificado
-            loss = criterion(pred_logits, target) / accum_steps
+        target_soft = gaussian_blur(target_bin, kernel_size=15, sigma=3.0)
+        # Normalizamos para que el máximo sea 1.0
+        target_soft = target_soft / (target_soft.max() + 1e-6)
+
+        with torch.amp.autocast(device_type='cuda' if device.type == 'cuda' else 'cpu', enabled=(device.type == 'cuda')):
+            logits = model(input_seq)
+            # La loss ahora compara la predicción con la zona suave
+            loss = criterion(logits, target_soft)
+            loss = loss / accum_steps
 
         scaler.scale(loss).backward()
-        
+
         if (batch_idx + 1) % accum_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-        
-        # Métricas de visualización
-        with torch.no_grad():
-            probs = torch.sigmoid(pred_logits)
-            preds = (probs > 0.5).float()
-            correct = (preds == target).sum().item()
-            total_correct += correct
-            total_pixels += target.numel()
-            total_loss += loss.item() * accum_steps
-            
-        pbar.set_postfix({'loss': f'{loss.item()*accum_steps:.4f}', 'acc': f'{correct/target.numel():.4f}'})
 
-    return total_loss / len(loader), total_correct / total_pixels, 0.0
+        total_loss += loss.item() * accum_steps
+        pbar.set_postfix({'loss': f'{total_loss/(batch_idx+1):.4f}'})
 
-
-
+    return total_loss / len(loader)
 @torch.no_grad()
-def validate(model, loader, device,criterion, pred_horizon=1):
+def validate_zonal(model, loader, device, criterion, pred_horizon=1, tolerance_px=3, epoch=0, num_display_images=3):
     model.eval()
-    total_loss = 0
-    tp, fp, fn, tn = 0, 0, 0, 0
+    total_loss = 0.0
+    g_tp, g_fp, g_fn = 0, 0, 0
     
-    pbar = tqdm(loader, desc="Validation")
-    
-    for batch in pbar:
+    # Para guardar ejemplos visuales
+    display_count = 0 
+
+    for batch_idx, batch in enumerate(tqdm(loader, desc=f"Validation Epoch {epoch+1}")):
         x = batch['x'].to(device)
-        labels = batch['label'].float().to(device)
-        
+        targets = batch['label'].float().to(device)
         input_seq = x[:, :-pred_horizon]
-        target = labels[:, -1].unsqueeze(1)
+        target_bin = targets[:, -1].unsqueeze(1) # [B, 1, H, W]
+
+        logits = model(input_seq)
+        probs = torch.sigmoid(logits) # Esto es la predicción del modelo (mancha de riesgo)
         
-        with torch.amp.autocast(device_type='cuda', enabled=(device.type == 'cuda')):
-            pred_logits = model(input_seq)
-            loss = criterion(pred_logits, target)
-            
+        # Calculamos loss contra el suave para ser consistentes
+        t_soft = gaussian_blur(target_bin, kernel_size=11, sigma=2.0)
+        # Normalizar para que el pico de la zona sea 1.0
+        max_val_target = t_soft.max()
+        if max_val_target > 0:
+            t_soft = t_soft / max_val_target
+        loss = criterion(logits, t_soft)
         total_loss += loss.item()
+
+        # --- LÓGICA DE VISUALIZACIÓN ---
+        if display_count < num_display_images:
+            # Buscar una muestra con fuego para visualizar
+            # target_bin.sum(dim=[1,2,3]) nos da la suma de pixeles de fuego en cada batch
+            fire_indices = (target_bin.sum(dim=[1,2,3]) > 0).nonzero(as_tuple=True)[0]
+            
+            if fire_indices.numel() > 0: # Si hay al menos un incendio en este batch
+                # Tomar el primer incendio para visualizar
+                sample_idx = fire_indices[0].item()
+                
+                original_target_np = target_bin[sample_idx, 0].cpu().numpy()
+                soft_target_np = t_soft[sample_idx, 0].cpu().numpy()
+                prediction_np = probs[sample_idx, 0].cpu().numpy()
+
+                plt.figure(figsize=(15, 5))
+                plt.suptitle(f"Epoch {epoch+1} - Sample {batch_idx*loader.batch_size + sample_idx + 1}")
+
+                plt.subplot(1, 3, 1)
+                plt.imshow(original_target_np, cmap='hot', vmin=0, vmax=1)
+                plt.title("Target Binario (Fuego Real)")
+                plt.axis('off')
+                
+                plt.subplot(1, 3, 2)
+                plt.imshow(soft_target_np, cmap='hot', vmin=0, vmax=1)
+                plt.title("Target Suavizado (Zona de Riesgo)")
+                plt.axis('off')
+
+                plt.subplot(1, 3, 3)
+                plt.imshow(prediction_np, cmap='hot', vmin=0, vmax=1)
+                plt.title("Predicción (Probabilidad de Zona)")
+                plt.axis('off')
+                
+                plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+                plt.show()
+                display_count += 1
         
-        probs = torch.sigmoid(pred_logits)
-        preds = (probs > 0.3).float() # Puedes ajustar este umbral a 0.3 si el fuego es muy escaso
+        # --- MÉTRICAS CON TOLERANCIA ---
+        preds_bin = (probs > 0.5).float() # Binarizamos la predicción para métricas
+        target_dilated = F.max_pool2d(target_bin, kernel_size=2*tolerance_px+1, stride=1, padding=tolerance_px)
         
-        tp += (preds * target).sum().item()
-        fp += (preds * (1 - target)).sum().item()
-        fn += ((1 - preds) * target).sum().item()
-        tn += ((1 - preds) * (1 - target)).sum().item()
+        g_tp += (preds_bin * target_dilated).sum().item()
+        g_fp += (preds_bin * (1 - target_dilated)).sum().item()
+        g_fn += ((1 - F.max_pool2d(preds_bin, 3, 1, 1)) * target_bin).sum().item()
 
-    # Cálculo de métricas
-    epsilon = 1e-7
-    precision = tp / (tp + fp + epsilon)
-    recall = tp / (tp + fn + epsilon)
-    f1 = 2 * (precision * recall) / (precision + recall + epsilon)
-    iou_fire = tp / (tp + fp + fn + epsilon)
-    accuracy = (tp + tn) / (tp + tn + fp + fn + epsilon)
-
-    print(f"\nVal F1: {f1:.4f} | IoU Fire: {iou_fire:.4f} | Acc: {accuracy:.4f}")
-    return total_loss / len(loader), accuracy, f1, iou_fire
-
-CHECKPOINT_DIR = 'saved/checkpoints'
-
-def save_checkpoint(model, optimizer, scheduler, epoch, best_iou):
-    """Guarda el checkpoint de la época actual."""
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    filepath = os.path.join(CHECKPOINT_DIR, f'checkpoint_epoch_{epoch+1}.pth')
+    precision = g_tp / (g_tp + g_fp + 1e-6)
+    recall = g_tp / (g_tp + g_fn + 1e-6)
+    f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
     
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'best_iou': best_iou,
-    }
-    torch.save(checkpoint, filepath)
-    print(f"  Checkpoint guardado: {filepath}")
-
-
-def load_checkpoint(model, optimizer, scheduler):
-    """Carga el último checkpoint disponible en la carpeta de checkpoints."""
-    if not os.path.exists(CHECKPOINT_DIR):
-        return 0, 0
-    
-    files = [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith('checkpoint_epoch_') and f.endswith('.pth')]
-    
-    if not files:
-        return 0, 0
-        
-    try:
-        files.sort(key=lambda x: int(x.split('_')[2].split('.')[0]))
-        last_file = files[-1]
-        filepath = os.path.join(CHECKPOINT_DIR, last_file)
-        
-        print(f"Intentando cargar último checkpoint: {filepath}")
-        checkpoint = torch.load(filepath, map_location='cpu')
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        start_epoch = checkpoint['epoch'] + 1
-        best_iou = checkpoint.get('best_iou', 0.0)
-        
-        print(f"✓ Checkpoint cargado exitosamente: continuando desde epoch {start_epoch}")
-        return start_epoch, best_iou
-    except Exception as e:
-        print(f"⚠️ Error cargando checkpoint: {e}")
-        return 0, 0
-
-
-def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Usando dispositivo: {device}")
-
-    plt.ion()
-    
-    # Calcular Peso Positivo (Deprecated by Focal Loss, but keeping variable for signature compatibility if needed)
-    pos_weight = None 
-    criterion = DiceFocalLoss(alpha=0.95, dice_weight=0.7).to(device)
-    
-    # Configuración del modelo
-    model = UNet3D(in_channels=28, out_channels=1).to(device)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=5, factor=0.5
-    )
-    
-    # Cargar último checkpoint automáticamente
-    start_epoch, best_metric = load_checkpoint(model, optimizer, scheduler)
-    
-    scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
-    
-    # Cargar o inicializar historial
-    history_file = 'train_history.json'
-    if os.path.exists(history_file) and start_epoch > 0:
-        try:
-            with open(history_file, 'r') as f:
-                history = json.load(f)
-        except:
-            history = []
-    else:
-        history = []
-        
-    for epoch in range(start_epoch, EPOCHS):
-        print(f"Epoch {epoch+1}/{EPOCHS}")
-        
-        train_loss, train_acc, _ = train_epoch(model, dataloader_train, optimizer, scaler, device, 
-                                               criterion,
-                                               pred_horizon=PRED_SEQ_LEN, accum_steps=ACCUM_STEPS)
-        val_loss, val_acc, val_f1, val_iou = validate(model, dataloader_val, device,criterion, pred_horizon=PRED_SEQ_LEN)
-        
-        scheduler.step(val_f1) # Optimize for F1 instead of Acc in imbalanced binary
-        
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | F1: {val_f1:.4f} | Mean IoU: {val_iou:.4f}")
-        
-        # Guardar métricas en historial
-        epoch_metrics = {
-            'epoch': epoch + 1,
-            'train_loss': train_loss,
-            'train_acc': train_acc,
-            'val_loss': val_loss,
-            'val_acc': val_acc,
-            'val_f1': val_f1,
-            'val_mean_iou': val_iou,
-        }
-        history.append(epoch_metrics)
-        with open(history_file, 'w') as f:
-            json.dump(history, f, indent=4)
-        
-        if val_f1 > best_metric: # Save best by F1
-            best_metric = val_f1
-            os.makedirs('saved', exist_ok=True)
-            torch.save(model.state_dict(), 'saved/best_model.pth')
-            print(f"  Mejor modelo guardado (F1: {best_metric:.4f}) en saved/best_model.pth")
-        
-        # Guardar checkpoint de esta época
-        save_checkpoint(model, optimizer, scheduler, epoch, best_metric)
-    
-    print(f"\nEntrenamiento completado. Mejor F1: {best_metric:.4f}")
-
-
-if __name__ == '__main__':
-    main()
-
+    print(f"\n[VAL ZONAL] F1: {f1:.4f} | Prec: {precision:.4f} | Rec: {recall:.4f} (Tol: {tolerance_px}px)")
+    return total_loss / len(loader), f1
