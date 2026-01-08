@@ -1,410 +1,206 @@
-from torch.utils.data import Dataset
+import os
+import random
+import torch
 import numpy as np
 import rasterio
+from rasterio.windows import Window
+from torch.utils.data import Dataset
 from pathlib import Path
-import os
-import torch
-from torch.nn.utils.rnn import pad_sequence
-from rasterio import Affine
-from rasterio.warp import reproject, Resampling
-
-
-class TSDataset(Dataset):
-    def __init__(self, path_valid, shapes, train=False, augment=False, cache_dir=None):
-        self.total = 0
+from constants import MAX_INPUT_SEQ_LEN, PRED_SEQ_LEN
+class TSDatasetROI(Dataset):
+    def __init__(
+        self,
+        path_valid,
+        cache_dir,
+        train=False,
+        augment=False,
+        crop_size=192,
+        max_rois=4,
+        augment_factor=3  
+    ):
         self.train = train
         self.augment = augment
+        self.crop_size = crop_size
+        self.max_rois = max_rois
+        self.augment_factor = augment_factor if train else 1
+
         self.image_paths = self._find_tiff_files(path_valid)
-        self.shapes = shapes
-        self.cache_dir = Path(cache_dir) if cache_dir else None
-        
-        if self.cache_dir:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def _apply_augmentation(self, combined, labels, label_masks):
-        """
-        Aplica aumentaciones espaciales y ruido Gaussiano de forma consistente 
-        a través de toda la secuencia temporal.
-        """
-        # combined: (T, C, H, W)
-        # labels: (T, H, W)
-        # label_masks: (T, H, W)
-        
-        # 1. Aumentaciones Espaciales (Flips y Rotaciones)
-        if np.random.random() > 0.5:
-            # Elegir aleatoriamente una transformación
-            aug_type = np.random.choice(['flip_h', 'flip_v', 'rot90', 'rot180', 'rot270'])
-            
-            if aug_type == 'flip_h':
-                combined = torch.flip(combined, dims=[-1])
-                labels = torch.flip(labels, dims=[-1])
-                label_masks = torch.flip(label_masks, dims=[-1])
-            elif aug_type == 'flip_v':
-                combined = torch.flip(combined, dims=[-2])
-                labels = torch.flip(labels, dims=[-2])
-                label_masks = torch.flip(label_masks, dims=[-2])
-            elif aug_type == 'rot90':
-                combined = torch.rot90(combined, k=1, dims=[-2, -1])
-                labels = torch.rot90(labels, k=1, dims=[-2, -1])
-                label_masks = torch.rot90(label_masks, k=1, dims=[-2, -1])
-            elif aug_type == 'rot180':
-                combined = torch.rot90(combined, k=2, dims=[-2, -1])
-                labels = torch.rot90(labels, k=2, dims=[-2, -1])
-                label_masks = torch.rot90(label_masks, k=2, dims=[-2, -1])
-            elif aug_type == 'rot270':
-                combined = torch.rot90(combined, k=3, dims=[-2, -1])
-                labels = torch.rot90(labels, k=3, dims=[-2, -1])
-                label_masks = torch.rot90(label_masks, k=3, dims=[-2, -1])
-
-        # 2. Ruido Gaussiano (solo en los canales de entrada 'combined')
-        # Aplicamos ruido pequeño para robustez
-        if np.random.random() > 0.5:
-            noise = torch.randn_like(combined) * 0.01 
-            combined = combined + noise
-            # Opcional: clip para mantener rango [0, 1] si los datos están normalizados
-            combined = torch.clamp(combined, 0.0, 1.0)
-            
-        return combined, labels, label_masks
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _find_tiff_files(self, paths):
         r = {}
-        idx = 1
-        for i in paths:
-            self.total += 1
-            r[idx] = {}
-            carpetas = os.listdir(i)
-            d = []; n = []; l = []; f = []
-            for j in carpetas:
-                path = Path(i, j)
-                for p in path.rglob("*.tif"):
-                    if j == 'ESRI_LULC':
-                        l.append(p)
-                    elif j == 'FirePred':
-                        f.append(p)
-                    elif j == 'VIIRS_Day':
-                        d.append(p)
-                    else:
-                        n.append(p)
-            # Ordenar por nombre de archivo (contiene fecha)
-            r[idx]['ESRI_LULC'] = sorted(l, key=lambda x: x.name)
-            r[idx]['FirePred'] = sorted(f, key=lambda x: x.name)
-            r[idx]['VIIRS_Day'] = sorted(d, key=lambda x: x.name)
-            r[idx]['VIIRS_Night'] = sorted(n, key=lambda x: x.name)
+        idx = 0
+        for base in paths:
+            r[idx] = {k: [] for k in ["ESRI_LULC", "FirePred", "VIIRS_Day", "VIIRS_Night"]}
+            for folder in os.listdir(base):
+                p = Path(base, folder)
+                if p.is_dir():
+                    for tif in p.rglob("*.tif"):
+                        if folder in r[idx]:
+                            r[idx][folder].append(tif)
+            for k in r[idx]:
+                r[idx][k] = sorted(r[idx][k], key=lambda x: x.name)
             idx += 1
         return r
 
     def __len__(self):
-        return self.total
+        return len(self.image_paths) * self.augment_factor
 
-    def open_tif(self, paths):
-        imgs, transforms, crss = [], [], []
-        for path in paths:
-            with rasterio.open(path) as src:
-                img = src.read()  # (C, H, W)
-                imgs.append(img)
-                transforms.append(src.transform)
-                crss.append(src.crs)
-        return imgs, transforms, crss
-
-    def _resize_rasterio(self, img, src_transform, src_crs, target_shape=(256, 256), resampling=Resampling.bilinear):
-        """
-        img: ndarray (C, H, W)
-        src_transform: Affine transform from original raster
-        src_crs: CRS (e.g., 'EPSG:4326')
-        target_shape: (H_new, W_new) — e.g., (256, 256)
-        resampling: rasterio.warp.Resampling.*
-        Returns: (new_img, new_transform)
-        """
-        H, W = img.shape[-2], img.shape[-1]
-        H_new, W_new = target_shape
-    
-        scale_x = W / W_new
-        scale_y = H / H_new
-        new_transform = src_transform * src_transform.scale(scale_x, scale_y)
-    
-        # Allocate output
-        dst_shape = (img.shape[0], H_new, W_new)
-        dst_img = np.empty(dst_shape, dtype=img.dtype)
-    
-        reproject(
-            source=img,
-            destination=dst_img,
-            src_transform=src_transform,
-            src_crs=src_crs,
-            dst_transform=new_transform,
-            dst_crs=src_crs,  # keep same CRS
-            resampling=resampling
-        )
-        return dst_img, new_transform
-
-    
-    def _normalize_data(self, data, is_label=False):
-        """
-        Normaliza los datos a rangos seguros [0, 1].
-        Maneja NaNs, valores negativos de error y outliers.
-        """
-        # 1. Limpieza básica de NaNs
-        data = np.nan_to_num(data, nan=0.0)
-        
+    def _normalize(self, x, is_label=False):
+        x = np.nan_to_num(x, nan=0.0)
         if is_label:
-            # Etiquetas: [0, 1] estricto
-            # Eliminar valores negativos (NoData)
-            data[data < 0] = 0.0
-            # Clip a 1.0 
-            data = np.clip(data, 0.0, 1.0)
-        else:
-            # Inputs: Limpiar basura negativa (ej. -9999)
-            data[data < -100] = 0.0
-            
-            # Normalización Min-Max por canal para estabilizar entrenamiento
-            # Si el array es 3D (C, H, W)
-            if data.ndim == 3:
-                for c in range(data.shape[0]):
-                    channel = data[c]
-                    min_val, max_val = channel.min(), channel.max()
-                    # Solo normalizar si hay rango dinámico
-                    if max_val - min_val > 1e-5:
-                        data[c] = (channel - min_val) / (max_val - min_val)
-                    else:
-                        # Si es constante y grande, bajarlo a 1.0
-                        if max_val > 1.0:
-                            data[c] = 1.0
-            # Si es 2D (H, W)
-            elif data.ndim == 2:
-                min_val, max_val = data.min(), data.max()
-                if max_val - min_val > 1e-5:
-                    data = (data - min_val) / (max_val - min_val)
-                elif max_val > 1.0:
-                    data[:] = 1.0
-                    
-        return data
+            x[x < 0] = 0.0
+            return np.clip(x, 0.0, 1.0)
+        
+        x[x < -100] = 0.0
+        for c in range(x.shape[0]):
+            vmin, vmax = x[c].min(), x[c].max()
+            if vmax - vmin > 1e-6:
+                x[c] = (x[c] - vmin) / (vmax - vmin)
+        return x
 
-    def _preprocess(self, imgs, transforms, crss, is_day=False, is_night=False, is_fireP=False, target_shape=(256, 256)):
-        news_imgs = []
-        labels = []
-        pixel_areas = []
-    
-        for img, src_transform, src_crs in zip(imgs, transforms, crss):
-            if img.ndim == 2:
-                img = img[None, :, :]
-            
-            if is_day:
-                # Separar datos y label
-                img_data = img[:-2, :, :]  # (C-2, H, W) - datos
-                
-                raw_fire = img[-2, :, :]   # (H, W)
-                
-                # Crear máscara de validez basada en NaNs originales
-                raw_mask = (~np.isnan(raw_fire)).astype(np.float32)
-                
-                # Normalizar Label (raw_fire) ANTES de resize para que el average funcione bien sobre 0-1
-                raw_fire = self._normalize_data(raw_fire, is_label=True)
-                
-                # Procesar DATOS con bilinear
-                img_resized, new_transform = self._resize_rasterio(
-                    img_data, src_transform, src_crs, 
-                    target_shape=target_shape, resampling=Resampling.bilinear
-                )  # (C-2, 256, 256)
 
-               
-                
-                # Procesar LABEL (Fire) con AVERAGE para soft labels
-                fire_resized, _ = self._resize_rasterio(
-                    raw_fire[None, :, :], src_transform, src_crs,
-                    target_shape=target_shape, resampling=Resampling.average
-                )
-                
-                # Procesar MASK con AVERAGE para consistencia y luego binarizar
-                mask_resized, _ = self._resize_rasterio(
-                    raw_mask[None, :, :], src_transform, src_crs,
-                    target_shape=target_shape, resampling=Resampling.average
-                )
-                # válido si hay al menos un poco de información válida 
-                
-                mask_resized = (mask_resized > 0.0001).astype(np.float32)
-                
-                # Asignar
-                fire_label = fire_resized[0] # Ya es soft label (0.0 - 1.0)
-                label_mask = mask_resized[0]
-                
-                # Normalizar (Inputs)
-                img_resized = self._normalize_data(img_resized, is_label=False)
-                
-                news_imgs.append(img_resized)
-                labels.append((fire_label, label_mask))
-                
-            else:
-                # Para otros casos, decidir resampling según tipo
-                if is_fireP:
-                    resampling = Resampling.nearest
-                elif is_night:
-                    resampling = Resampling.bilinear
-                else:  # LULC: nearest 
-                    resampling = Resampling.nearest
-                
-                # Resize con georeferencia
-                img_resized, _ = self._resize_rasterio(
-                    img, src_transform, src_crs, 
-                    target_shape=target_shape, resampling=resampling
-                )  # (C, 256, 256)
-                
-                # Normalizar DATOS (Inputs)
-                # Si es fireP, quizás queramos tratarlo diferente, pero por ahora normalizamos todo
-                img_resized = self._normalize_data(img_resized, is_label=False)
-                
-                # Para night, si tiene 5 canales, tomar solo los últimos 2
-                if is_night and img_resized.shape[0] == 5:
-                    img_resized = img_resized[-2:, :, :]
-                
-                news_imgs.append(img_resized)
-    
-        if is_day:
-            label_imgs, label_masks = zip(*labels) if labels else ([], [])
-            return news_imgs, list(label_imgs), list(label_masks)
-        else:
-            return news_imgs
+
+    def _apply_augmentation(self, x, y):
+        k = random.randint(0, 3) # Rotaciones 90 deg
+        if k > 0:
+            x = np.rot90(x, k=k, axes=(-2, -1))
+            y = np.rot90(y, k=k, axes=(-2, -1))
+
+        f = random.choice([None, 'horizontal', 'vertical'])
+        if f == 'horizontal':
+            x = np.flip(x, axis=-1)
+            y = np.flip(y, axis=-1)
+        elif f == 'vertical':
+            x = np.flip(x, axis=-2)
+            y = np.flip(y, axis=-2)
+
+        return x.copy(), y.copy()
 
     def __getitem__(self, idx):
-        # Intentar cargar de caché primero
-        cache_file = None
-        if self.cache_dir:
-            # Crear un nombre único para el sample basado en su índice y configuración
-            cache_name = f"sample_{idx}_{self.shapes[0]}x{self.shapes[1]}.pt"
-            cache_file = self.cache_dir / cache_name
+        real_idx = idx % len(self.image_paths)
+        is_augmented_instance = idx >= len(self.image_paths)
+        
+        paths = self.image_paths[real_idx]
+        needed = MAX_INPUT_SEQ_LEN + PRED_SEQ_LEN
+        
+        def last_n(l): return l[-needed:] if len(l) > needed else l
+        
+        day_p = last_n(paths["VIIRS_Day"])
+        night_p = last_n(paths["VIIRS_Night"])
+        firep_p = last_n(paths["FirePred"])
+        lulc_p = paths["ESRI_LULC"][0]
+        
+        # Ahora centers siempre tiene longitud self.max_rois
+        centers = self._find_rois(day_p)
+        half = self.crop_size // 2
+        
+        with rasterio.open(day_p[0]) as ref_src:
+            base_h, base_w = ref_src.height, ref_src.width
+
+        def read_with_padding(src, cy, cx, is_fire_label=False):
+            y1_s = max(0, cy - half)
+            x1_s = max(0, cx - half)
+            read_w = max(0, min(self.crop_size, src.width - x1_s))
+            read_h = max(0, min(self.crop_size, src.height - y1_s))
             
-            if cache_file.exists():
-                try:
-                    data = torch.load(cache_file)
-                    combined_tensor = data['combined']
-                    labels_tensor = data['labels']
-                    masks_tensor = data['masks']
-                   
-                    
-                    # Aplicar aumentación si es necesario (la aumentación NO se cachea)
-                    if self.train and self.augment:
-                        combined_tensor, labels_tensor, masks_tensor = self._apply_augmentation(
-                            combined_tensor, labels_tensor, masks_tensor
-                        )
-                    return combined_tensor, labels_tensor, masks_tensor, 
-                except Exception as e:
-                    print(f"Error cargando caché {cache_file}: {e}")
-
-        # Si no hay caché o falló, procesar normalmente
-        paths = self.image_paths[idx+1]
-        
-        needed_len = MAX_INPUT_SEQ_LEN + PRED_SEQ_LEN
-        
-        # Helper para coger los últimos N elementos
-        def get_last_n(l, n):
-            return l[-n:] if len(l) > n else l
-
-        # Seleccionar solo los archivos necesarios (últimos N)
-        day_paths = get_last_n(paths['VIIRS_Day'], needed_len)
-        night_paths = get_last_n(paths['VIIRS_Night'], needed_len)
-        fire_paths = get_last_n(paths['FirePred'], needed_len)
-        static_paths = paths['ESRI_LULC']
-
-        seq_day, t_day, crs_day = self.open_tif(day_paths)
-        seq_night, t_night, crs_night = self.open_tif(night_paths)
-        seq_firepred, t_fire, crs_fire = self.open_tif(fire_paths)
-        static_img, t_static, crs_static = self.open_tif(static_paths)
-
-        # Preprocesar con máquinas
-        day_imgs, labels, label_masks = self._preprocess(seq_day, t_day, crs_day, 
-                                                                   is_day=True, target_shape=self.shapes)
-        night_imgs = self._preprocess(seq_night, t_night, crs_night, 
-                                                  is_night=True, target_shape=self.shapes)
-        fire_imgs = self._preprocess(seq_firepred, t_fire, crs_fire, 
-                                                is_fireP=True, target_shape=self.shapes)
-        lulc_imgs = self._preprocess(static_img, t_static, crs_static, 
-                                                target_shape=self.shapes)
-
-        # Convertir a numpy
-        day_imgs = np.array(day_imgs).astype(np.float32)      # (T, C_day, H, W)
-        night_imgs = np.array(night_imgs).astype(np.float32)  # (T, C_night, H, W)
-        fire_imgs = np.array(fire_imgs).astype(np.float32)    # (T, C_fire, H, W)
-        lulc_img = np.array(lulc_imgs[0]).astype(np.float32)  # (C_lulc, H, W)
-        
-        labels = np.array(labels) # (T, H, W)
-        # Discretizar labels en clases (Cualquier valor > 0 es incendio) -> Estrictamente 1 o 0
-        labels = (labels > 0.0).astype(np.float32)
-        
-        label_masks = np.array(label_masks).astype(np.float32)
-     
-
-        # Obtener T (usando day como referencia, asumiendo todos tienen mismo T)
-        T = day_imgs.shape[0]
-        
-        # Ajustar night y fire al mismo T que day (truncar o padear)
-        if night_imgs.shape[0] != T:
-            if night_imgs.shape[0] > T:
-                night_imgs = night_imgs[:T]
+            win_s = Window(x1_s, y1_s, read_w, read_h)
+            data = src.read(window=win_s)
+            
+            pad_y = self.crop_size - read_h
+            pad_x = self.crop_size - read_w
+            
+            if is_fire_label:
+                if data.ndim == 3: data = data[-1] # Tomar última banda si es 3D
+                pad_shape = [(0, pad_y), (0, pad_x)]
             else:
-                pad_t = T - night_imgs.shape[0]
-                night_imgs = np.pad(night_imgs, ((0, pad_t), (0, 0), (0, 0), (0, 0)), mode='constant')
-        
-        if fire_imgs.shape[0] != T:
-            if fire_imgs.shape[0] > T:
-                fire_imgs = fire_imgs[:T]
-            else:
-                pad_t = T - fire_imgs.shape[0]
-                fire_imgs = np.pad(fire_imgs, ((0, pad_t), (0, 0), (0, 0), (0, 0)), mode='constant')
-
-        # Expandir LULC (estático) a T timesteps: (C_lulc, H, W) → (T, C_lulc, H, W)
-        lulc_expanded = np.tile(lulc_img[None, :, :, :], (T, 1, 1, 1))
-
-        # Combinar todos los canales en una sola imagen
-        # combined: (T, C_day + C_night + C_fire + C_lulc, H, W)
-        combined = np.concatenate([day_imgs, night_imgs, fire_imgs, lulc_expanded], axis=1)
-
-        # To tensor
-        combined_tensor = torch.from_numpy(combined)
-        labels_tensor = torch.from_numpy(labels)
-        masks_tensor = torch.from_numpy(label_masks)
-
-        # Guardar en caché antes de aumentación
-        if cache_file:
-            try:
+                pad_shape = [(0, 0), (0, pad_y), (0, pad_x)]
                 
-                torch.save({
-                    'combined': combined_tensor,
-                    'labels': labels_tensor,
-                    'masks': masks_tensor,
-                }, cache_file)
-                print(f"guardado -> {cache_file}")
-            except Exception as e:
-                print(f"Error guardando caché {cache_file}: {e}")
+            if pad_y > 0 or pad_x > 0:
+                data = np.pad(data, pad_shape, mode='constant', constant_values=0)
+            return data
 
-        # Aplicar aumentación si está en modo entrenamiento y activado
-        if self.train and self.augment:
-            combined_tensor, labels_tensor, masks_tensor = self._apply_augmentation(
-                combined_tensor, labels_tensor, masks_tensor
-            )
+        xs_roi, ys_roi = [], []
 
-        return (
-            combined_tensor,      # (T, C_total, H, W)
-            labels_tensor,        # (T, H, W)
-            masks_tensor,         # (T, H, W)
-             )
+        for roi_id, (cy, cx) in enumerate(centers):
+            # Usamos el real_idx para el cache para que la aumentación sea al vuelo
+            cache_f = self._cache_file(real_idx, roi_id)
+            
+            if cache_f.exists():
+                try:
+                    data = np.load(cache_f)
+                    xs_roi.append(data["x"])
+                    ys_roi.append(data["y"])
+                    continue
+                except: pass
 
+            seq_x, seq_y = [], []
+            for dp, np_, fp in zip(day_p, night_p, firep_p):
+                with rasterio.open(dp) as dsrc, rasterio.open(np_) as nsrc, rasterio.open(fp) as fsrc:
+                    day_full = read_with_padding(dsrc, cy, cx)
+                    day = self._normalize(day_full[:-2])
+                    fire = self._normalize(day_full[-1], is_label=True) # Canal count
+                    night = self._normalize(read_with_padding(nsrc, cy, cx)[-2:])
+                    firep = self._normalize(read_with_padding(fsrc, cy, cx))
+                    
+                    seq_x.append(np.concatenate([day, night, firep], axis=0))
+                    seq_y.append(fire)
+
+            # LULC
+            with rasterio.open(lulc_p) as lsrc:
+                scale_y, scale_x = lsrc.height / base_h, lsrc.width / base_w
+                l_cy, l_cx = int(cy * scale_y), int(cx * scale_x)
+                lulc_crop = read_with_padding(lsrc, l_cy, l_cx)
+                for t in range(len(seq_x)):
+                    seq_x[t] = np.concatenate([seq_x[t], lulc_crop], axis=0)
+
+            # Padding Temporal
+            t_len = len(seq_x)
+            if t_len < needed:
+                zeros_x = np.zeros((seq_x[0].shape[0], self.crop_size, self.crop_size))
+                zeros_y = np.zeros((self.crop_size, self.crop_size))
+                seq_x += [zeros_x] * (needed - t_len)
+                seq_y += [zeros_y] * (needed - t_len)
+
+            x_stack, y_stack = np.stack(seq_x), np.stack(seq_y)
+            np.savez_compressed(cache_f, x=x_stack, y=y_stack)
+            xs_roi.append(x_stack)
+            ys_roi.append(y_stack)
+
+        xs_final = np.stack(xs_roi) 
+        ys_final = np.stack(ys_roi) 
+
+        # Aplicar aumentación si es entrenamiento
+        if self.augment and is_augmented_instance:
+            xs_final, ys_final = self._apply_augmentation(xs_final, ys_final)
+
+        return torch.from_numpy(xs_final).float(), torch.from_numpy(ys_final).float()
+
+    def _cache_file(self, idx, roi_id):
+        return self.cache_dir / f"sample_{idx:05d}_roi_{roi_id}.npz"
 
 def collate_fn(batch):
-    """
-    Collate function simplificada para datos combinados.
+    x, y = zip(*batch)
     
-    Input por muestra: (combined, labels, label_masks, pixel_areas)
-    Output: dict con tensores paddeados
-    """
+    # Limpieza de dimensiones (Batch, ROIs, T, C, H, W)
+    x = [xx.squeeze(0) if xx.ndim == 6 else xx for xx in x]
+    y = [yy.squeeze(0) if yy.ndim == 5 else yy for yy in y]
 
-    combined_list, labels_list, label_masks_list = zip(*batch)
-
-    # Padding temporal: (B, T_max, C, H, W)
-    combined_padded = pad_sequence(combined_list, batch_first=True, padding_value=0.0)
-    labels_padded = pad_sequence(labels_list, batch_first=True, padding_value=0.0)
-    label_masks_padded = pad_sequence(label_masks_list, batch_first=True, padding_value=0.0)
-
+    # Aunque ahora siempre debería ser max_rois por el replace=True, 
+    # mantenemos el padding por seguridad si cambias el código.
+    max_rois = max([xx.shape[0] for xx in x])
+    
+    x_pad, y_pad = [], []
+    for xx, yy in zip(x, y):
+        pad_n = max_rois - xx.shape[0]
+        if pad_n > 0:
+            xx = torch.cat([xx, torch.zeros(pad_n, *xx.shape[1:])], dim=0)
+            yy = torch.cat([yy, torch.zeros(pad_n, *yy.shape[1:])], dim=0)
+        x_pad.append(xx)
+        y_pad.append(yy)
+            
     return {
-        'x': combined_padded,              # (B, T, C_total, H, W)
-        'label': labels_padded,            # (B, T, H, W)
-        'label_mask': label_masks_padded,  # (B, T, H, W)
+        'x': torch.stack(x_pad),
+        'label': torch.stack(y_pad)
     }
