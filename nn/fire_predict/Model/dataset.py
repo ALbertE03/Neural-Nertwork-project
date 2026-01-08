@@ -15,13 +15,14 @@ class TSDatasetROI(Dataset):
         train=False,
         augment=False,
         crop_size=192,
-        max_rois=4,
-        augment_factor=3  
+        max_rois=5,
+        augment_factor=4  
     ):
         self.train = train
         self.augment = augment
         self.crop_size = crop_size
         self.max_rois = max_rois
+        # Si no es entrenamiento, no aumentamos
         self.augment_factor = augment_factor if train else 1
 
         self.image_paths = self._find_tiff_files(path_valid)
@@ -60,14 +61,36 @@ class TSDatasetROI(Dataset):
                 x[c] = (x[c] - vmin) / (vmax - vmin)
         return x
 
-
+    def _find_rois(self, label_paths):
+        acc = None
+        for p in label_paths:
+            with rasterio.open(p) as src:
+                fire = src.read(src.count - 1)  
+                fire = (np.nan_to_num(fire) > 0).astype(np.float32)
+                acc = fire if acc is None else acc + fire
+        
+        ys, xs = np.where(acc > 0)
+        if len(ys) == 0:
+            h, w = acc.shape
+            return [(h // 2, w // 2)]
+        
+        num_to_pick = min(self.max_rois, len(ys))
+        idx = np.random.choice(len(ys), num_to_pick, replace=False)
+        return list(zip(ys[idx], xs[idx]))
 
     def _apply_augmentation(self, x, y):
-        k = random.randint(0, 3) # Rotaciones 90 deg
+        """
+        Aplica rotaciones de 90 grados y flips de forma aleatoria.
+        x: (ROIs, T, C, H, W)
+        y: (ROIs, T, H, W)
+        """
+        # Rotación aleatoria (0, 90, 180, 270 grados)
+        k = random.randint(0, 3)
         if k > 0:
             x = np.rot90(x, k=k, axes=(-2, -1))
             y = np.rot90(y, k=k, axes=(-2, -1))
 
+        # Flip aleatorio
         f = random.choice([None, 'horizontal', 'vertical'])
         if f == 'horizontal':
             x = np.flip(x, axis=-1)
@@ -79,6 +102,7 @@ class TSDatasetROI(Dataset):
         return x.copy(), y.copy()
 
     def __getitem__(self, idx):
+        # Mapeo de índice virtual a real
         real_idx = idx % len(self.image_paths)
         is_augmented_instance = idx >= len(self.image_paths)
         
@@ -92,13 +116,13 @@ class TSDatasetROI(Dataset):
         firep_p = last_n(paths["FirePred"])
         lulc_p = paths["ESRI_LULC"][0]
         
-        # Ahora centers siempre tiene longitud self.max_rois
         centers = self._find_rois(day_p)
         half = self.crop_size // 2
         
         with rasterio.open(day_p[0]) as ref_src:
             base_h, base_w = ref_src.height, ref_src.width
 
+        
         def read_with_padding(src, cy, cx, is_fire_label=False):
             y1_s = max(0, cy - half)
             x1_s = max(0, cx - half)
@@ -112,7 +136,7 @@ class TSDatasetROI(Dataset):
             pad_x = self.crop_size - read_w
             
             if is_fire_label:
-                if data.ndim == 3: data = data[-1] # Tomar última banda si es 3D
+                if data.ndim == 3: data = data[-1]
                 pad_shape = [(0, pad_y), (0, pad_x)]
             else:
                 pad_shape = [(0, 0), (0, pad_y), (0, pad_x)]
@@ -124,7 +148,6 @@ class TSDatasetROI(Dataset):
         xs_roi, ys_roi = [], []
 
         for roi_id, (cy, cx) in enumerate(centers):
-            # Usamos el real_idx para el cache para que la aumentación sea al vuelo
             cache_f = self._cache_file(real_idx, roi_id)
             
             if cache_f.exists():
@@ -140,20 +163,21 @@ class TSDatasetROI(Dataset):
                 with rasterio.open(dp) as dsrc, rasterio.open(np_) as nsrc, rasterio.open(fp) as fsrc:
                     day_full = read_with_padding(dsrc, cy, cx)
                     day = self._normalize(day_full[:-2])
-                    fire = self._normalize(day_full[-1], is_label=True) # Canal count
+                   
+                    fire = self._normalize(day_full[6], is_label=True)
                     night = self._normalize(read_with_padding(nsrc, cy, cx)[-2:])
                     firep = self._normalize(read_with_padding(fsrc, cy, cx))
-                    
-                    seq_x.append(np.concatenate([day, night, firep], axis=0))
+
+                    seq_x.append(np.concatenate([day, fire[None, ...], night, firep], axis=0))
                     seq_y.append(fire)
 
             # LULC
             with rasterio.open(lulc_p) as lsrc:
                 scale_y, scale_x = lsrc.height / base_h, lsrc.width / base_w
                 l_cy, l_cx = int(cy * scale_y), int(cx * scale_x)
-                lulc_crop = read_with_padding(lsrc, l_cy, l_cx)
+                lulc_croped = read_with_padding(lsrc, l_cy, l_cx)
                 for t in range(len(seq_x)):
-                    seq_x[t] = np.concatenate([seq_x[t], lulc_crop], axis=0)
+                    seq_x[t] = np.concatenate([seq_x[t], lulc_croped], axis=0)
 
             # Padding Temporal
             t_len = len(seq_x)
@@ -168,11 +192,12 @@ class TSDatasetROI(Dataset):
             xs_roi.append(x_stack)
             ys_roi.append(y_stack)
 
-        xs_final = np.stack(xs_roi) 
-        ys_final = np.stack(ys_roi) 
+        # Convertir a Tensores
+        xs_final = np.stack(xs_roi) # (NumROIs, T, C, H, W)
+        ys_final = np.stack(ys_roi) # (NumROIs, T, H, W)
 
-        # Aplicar aumentación si es entrenamiento
-        if self.augment and is_augmented_instance:
+        #  aumentación 
+        if self.augment:
             xs_final, ys_final = self._apply_augmentation(xs_final, ys_final)
 
         return torch.from_numpy(xs_final).float(), torch.from_numpy(ys_final).float()
@@ -183,24 +208,26 @@ class TSDatasetROI(Dataset):
 def collate_fn(batch):
     x, y = zip(*batch)
     
-    # Limpieza de dimensiones (Batch, ROIs, T, C, H, W)
+
     x = [xx.squeeze(0) if xx.ndim == 6 else xx for xx in x]
     y = [yy.squeeze(0) if yy.ndim == 5 else yy for yy in y]
 
-    # Aunque ahora siempre debería ser max_rois por el replace=True, 
-    # mantenemos el padding por seguridad si cambias el código.
     max_rois = max([xx.shape[0] for xx in x])
     
     x_pad, y_pad = [], []
     for xx, yy in zip(x, y):
         pad_n = max_rois - xx.shape[0]
         if pad_n > 0:
-            xx = torch.cat([xx, torch.zeros(pad_n, *xx.shape[1:])], dim=0)
-            yy = torch.cat([yy, torch.zeros(pad_n, *yy.shape[1:])], dim=0)
-        x_pad.append(xx)
-        y_pad.append(yy)
+
+            xx_padded = torch.cat([xx, torch.zeros(pad_n, *xx.shape[1:])], dim=0)
+            yy_padded = torch.cat([yy, torch.zeros(pad_n, *yy.shape[1:])], dim=0)
+            x_pad.append(xx_padded)
+            y_pad.append(yy_padded)
+        else:
+            x_pad.append(xx)
+            y_pad.append(yy)
             
     return {
-        'x': torch.stack(x_pad),
-        'label': torch.stack(y_pad)
+        'x': torch.stack(x_pad),      # (B, max_rois, T, C, H, W)
+        'label': torch.stack(y_pad)   # (B, max_rois, T, H, W)
     }

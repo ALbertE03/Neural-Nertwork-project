@@ -24,35 +24,6 @@ def classification_metrics(pred, target, threshold=0.5):
     return {'precision': precision, 'recall': recall, 'f1': f1, 'iou': iou, 'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn}
 
 
-def test_zonal(model, loader, device, criterion):
-    model.eval()
-    total_loss = 0
-    all_preds = []
-    all_targets = []
-
-    with torch.no_grad():
-        for batch in tqdm(loader):
-            inputs = batch['x'].to(device)
-            targets = batch['label'].to(device)
-            target_last = targets[:, :, -1, :, :].unsqueeze(2)
-            preds = model(inputs)
-            loss = criterion(preds, target_last)
-            total_loss += loss.item()
-
-            preds_prob = torch.sigmoid(preds)
-            preds_bin = (preds_prob > 0.5).cpu().numpy()
-            targets_np = (target_last > 0.5).cpu().numpy()
-            all_preds.append(preds_bin.flatten())
-            all_targets.append(targets_np.flatten())
-
-    y_true = np.concatenate(all_targets)
-    y_pred = np.concatenate(all_preds)
-    test_f1 = f1_score(y_true, y_pred, zero_division=0)
-    test_iou = jaccard_score(y_true, y_pred, zero_division=0)
-    avg_loss = total_loss / len(loader)
-    print(f"Test - F1: {test_f1:.4f} | IoU: {test_iou:.4f} | Loss: {avg_loss:.4f}")
-    return avg_loss, test_f1, test_iou
-
 
 def sliding_window_predict(model, image, device, patch_size=192):
     # image: (T, C, H, W) o (1, T, C, H, W)

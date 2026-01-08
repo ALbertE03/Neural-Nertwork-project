@@ -9,22 +9,21 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import numpy as np
-from model import UNet3D
+from model import UNet3D,FireModelROI
 from dataset import TSDatasetROI, collate_fn
 from constants import LEARNING_RATE, EPOCHS
+
 def train_epoch(model, loader, optimizer, scaler, device, criterion, accum_steps=4):
     model.train()
     total_loss = 0
     optimizer.zero_grad()
 
     for i, batch in enumerate(tqdm(loader)):
-        # El collate_fn devuelve un diccionario
         inputs = batch['x'].to(device)      # (B, R, T, C, H, W)
         targets = batch['label'].to(device) # (B, R, T, H, W)
 
-        # La UNet predice solo el último paso. Extraemos el último paso del target.
-        # target_last shape: (B, R, 1, H, W)
-        target_last = targets[:, :, -1, :, :].unsqueeze(2)
+        inputs = inputs[:,:,:-1,:,:,:] # (B, R, T-1, C, H, W)
+        target_last = targets[:, :, -1, :, :].unsqueeze(2) # (B, R, 1, H, W)
 
         with torch.amp.autocast(device_type='cuda', enabled=scaler.is_enabled()):
             preds = model(inputs) # (B, R, 1, H, W)
@@ -59,9 +58,9 @@ def validate_zonal(model, loader, device, criterion, epoch=0):
         for i, batch in enumerate(tqdm(loader)):
             inputs = batch['x'].to(device)
             targets = batch['label'].to(device)
-            
-            # Target del último paso de tiempo: (B, R, 1, H, W)
-            target_last = targets[:, :, -1, :, :].unsqueeze(2)
+            inputs = inputs[:,:,:-1,:,:,:]  # (B, R, T-1, C, H, W)
+
+            target_last = targets[:, :, -1, :, :].unsqueeze(2) # (B, R, 1, H, W)
             
             preds = model(inputs)
             loss = criterion(preds, target_last)
@@ -179,14 +178,14 @@ class SoftZoneLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, logist, targets):
-        # Aplicamos Sigmoid si el modelo no lo tiene en la última capa
+        # Aplicamos Sigmoid 
         preds = torch.sigmoid(logist)
         
-        # Aplanar los tensores: (B*R, 1, H, W) -> (N,)
+        # (B*R, 1, H, W) -> (N,)
         preds = preds.reshape(-1)
         targets = targets.reshape(-1)
         logist = logist.reshape(-1)
-        # 1. Tversky Loss (Mejor que Dice para datos desbalanceados)
+        # Tversky Loss 
         tp = (preds * targets).sum()
         fp = (preds * (1 - targets)).sum()
         fn = ((1 - preds) * targets).sum()
@@ -194,8 +193,7 @@ class SoftZoneLoss(nn.Module):
         tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
         tversky_loss = 1 - tversky
         
-        # 2. Binary Cross Entropy con Logits (para estabilidad)
-        # Usamos clamp para evitar log(0)
+        # Binary Cross Entropy con Logits (para estabilidad)
         preds = torch.clamp(preds, self.smooth, 1.0 - self.smooth)
         bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(logist,targets)
 
@@ -208,7 +206,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
  
-    base_unet = UNet3D(in_channels=28, out_channels=1).to(device)
+    base_unet = UNet3D(in_channels=29, out_channels=1).to(device)
     model = FireModelROI(base_unet).to(device) 
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
