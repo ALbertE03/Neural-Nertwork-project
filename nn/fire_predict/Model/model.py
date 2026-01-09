@@ -34,7 +34,7 @@ class UNet3D(nn.Module):
     
         self.enc1_channels = enc1_channels
         self.enc2_channels = enc2_channels
-        self.bottleneck_channels = 256
+        self.bottleneck_channels = bottleneck_channels
 
         def conv_block(in_c, out_c, norm_c=None):
             # norm_c: canales para la segunda BatchNorm (opcional)
