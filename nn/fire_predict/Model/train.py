@@ -10,8 +10,9 @@ import seaborn as sns
 from tqdm import tqdm
 import numpy as np
 from model import UNet3D,FireModelROI
-from dataset import TSDatasetROI, collate_fn
 from constants import LEARNING_RATE, EPOCHS
+
+from sklearn.metrics import f1_score, jaccard_score
 
 def train_epoch(model, loader, optimizer, scaler, device, criterion, accum_steps=4):
     model.train()
@@ -43,11 +44,7 @@ def train_epoch(model, loader, optimizer, scaler, device, criterion, accum_steps
 
 
 
-import matplotlib.pyplot as plt
-from sklearn.metrics import f1_score, jaccard_score
-import numpy as np
-import torch
-from tqdm import tqdm
+
 def validate_zonal(model, loader, device, criterion, epoch=0):
     model.eval()
     total_loss = 0

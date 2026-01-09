@@ -22,7 +22,6 @@ class TSDatasetROI(Dataset):
         self.augment = augment
         self.crop_size = crop_size
         self.max_rois = max_rois
-        # Si no es entrenamiento, no aumentamos
         self.augment_factor = augment_factor if train else 1
 
         self.image_paths = self._find_tiff_files(path_valid)
@@ -85,8 +84,9 @@ class TSDatasetROI(Dataset):
         y: (ROIs, T, H, W)
         """
         # Rotación aleatoria (0, 90, 180, 270 grados)
-        k = random.randint(0, 3)
-        if k > 0:
+        p = random.random()
+        if p>0.5:
+            k = random.choice([1, 2, 3])  
             x = np.rot90(x, k=k, axes=(-2, -1))
             y = np.rot90(y, k=k, axes=(-2, -1))
 
