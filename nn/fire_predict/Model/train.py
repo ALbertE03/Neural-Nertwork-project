@@ -11,11 +11,14 @@ from tqdm import tqdm
 import numpy as np
 from constants import  EPOCHS, LEARNING_RATE
 from model import UNet3D
+
 CHECKPOINT_DIR='saved/checkpoints'
+
 def train_epoch(model, loader, optimizer, scaler, device, criterion, accum_steps=4):
     model.train()
     total_loss = 0
-
+    
+    # Contadores para métricas en GPU
     tp_total = torch.tensor(0.0).to(device)
     fp_total = torch.tensor(0.0).to(device)
     fn_total = torch.tensor(0.0).to(device)
@@ -23,19 +26,18 @@ def train_epoch(model, loader, optimizer, scaler, device, criterion, accum_steps
     optimizer.zero_grad()
 
     for i, (inputs, targets) in enumerate(tqdm(loader, desc="Training")):
-  
+
         input_history = inputs[:, :-1, :, :, :].to(device, non_blocking=True)
         target_future = targets[:, -1, :, :].to(device, non_blocking=True).unsqueeze(1)
 
         with torch.amp.autocast(device_type='cuda', enabled=scaler.is_enabled()):
-           
+     
             preds = model(input_history) 
-            
-           
+    
             loss = criterion(preds, target_future)
             loss_scaled = loss / accum_steps
 
-    
+
         scaler.scale(loss_scaled).backward()
 
         with torch.no_grad():
@@ -66,7 +68,6 @@ def train_epoch(model, loader, optimizer, scaler, device, criterion, accum_steps
     
     return avg_loss, train_f1.item(), train_iou.item()
 
-
 def validate_zonal(model, loader, device, criterion, epoch=0):
     model.eval()
     total_loss = 0
@@ -80,7 +81,7 @@ def validate_zonal(model, loader, device, criterion, epoch=0):
         for i, (inputs, targets) in enumerate(tqdm(loader, desc="Validating")):
 
             input_history = inputs[:, :-1, :, :, :].to(device, non_blocking=True)
-            target_future = targets[:, -1, :, :].to(device, non_blocking=True).unsqueeze(1)
+            target_future = targets[:, -1, :, :].to(device, non_blocking=True)
             
             preds = model(input_history)
             
@@ -106,10 +107,9 @@ def validate_zonal(model, loader, device, criterion, epoch=0):
     current_iou = tp_total / (tp_total + fp_total + fn_total + smooth)
 
     print(f"\n[Epoch {epoch}] Val Loss: {total_loss/len(loader):.4f}")
-    print(f"F1: {current_f1.item():.4f} | IoU: {current_iou.item():.4f} | Recall: {recall.item():.4f}")
+    print(f"[VAL] F1: {current_f1.item():.4f} | IoU: {current_iou.item():.4f} | Recall: {recall.item():.4f}")
 
     return total_loss / len(loader), current_f1.item(), current_iou.item()
-
 
 def load_checkpoint(model, optimizer, scheduler):
     """Carga el último checkpoint disponible."""
@@ -158,8 +158,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, best_f1, filename=None):
     torch.save(checkpoint, filepath)
 
 
-import torch.nn as nn
-import torch.nn.functional as F
 
 class SoftZoneLoss(nn.Module):
     def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
@@ -177,8 +175,8 @@ class SoftZoneLoss(nn.Module):
         # Necesita probabilidades (0 a 1)
         preds = torch.sigmoid(logits)
         
-        preds = preds.view(-1)
-        targets = targets.view(-1)
+        preds = preds.reshape(-1)
+        targets = targets.reshape(-1)
 
         tp = (preds * targets).sum()
         fp = (preds * (1 - targets)).sum()
@@ -189,71 +187,6 @@ class SoftZoneLoss(nn.Module):
 
         # Combinación pesada
         return 0.5 * bce_loss + 0.5 * tversky_loss
-    
-
-def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    model = UNet3D(in_channels=28, out_channels=1).to(device)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5, factor=0.5)
-    scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
-    criterion = SoftZoneLoss(alpha=0.8, beta=0.2)
-
-    start_epoch, best_f1 = load_checkpoint(model, optimizer, scheduler)
-    
-    history_file = 'train_history3.json'
-    history = []
-    if os.path.exists(history_file) and start_epoch > 0:
-        try:
-            with open(history_file, 'r') as f:
-                history = json.load(f)
-        except: pass
-
-    for epoch in range(start_epoch, EPOCHS):
-        print(f"\n--- Epoch {epoch+1}/{EPOCHS} ---")
-        
-        # Entrenamiento
-        train_loss = train_epoch(
-            model, dataloader_train, optimizer, scaler, 
-            device, criterion, accum_steps=4
-        )
-        
-        # Validación
-        val_loss, current_f1, current_iou = validate_zonal(
-            model, dataloader_val, device, criterion, epoch=epoch+1
-        )
-        
-
-        scheduler.step(current_f1)
-        
-        epoch_metrics = {
-            'epoch': epoch + 1,
-            'train_loss': float(train_loss),
-            'val_loss': float(val_loss),
-            'f1': float(current_f1),
-            'iou': float(current_iou),
-            'lr': float(optimizer.param_groups[0]['lr'])
-        }
-        history.append(epoch_metrics)
-        
-        with open(history_file, 'w') as f:
-            json.dump(history, f, indent=4)
-
-        # Guardar mejor modelo
-        if current_f1 > best_f1:
-            best_f1 = current_f1
-            print(f"[*] Nuevo récord F1: {best_f1:.4f}. Guardando...")
-            save_checkpoint(model, optimizer, scheduler, epoch, best_f1, filename="best_model.pth")
-        
-        # Guardado periódico de seguridad
-        if (epoch + 1) % 5 == 0:
-            save_checkpoint(model, optimizer, scheduler, epoch, best_f1, filename=f"checkpoint_ep{epoch+1}.pth")
-
-        print(f"Summary: Loss {val_loss:.4f} | F1 {current_f1:.4f} | IoU {current_iou:.4f} | Best F1: {best_f1:.4f}")
-
 
 
 def main():
@@ -281,7 +214,7 @@ def main():
         print(f"\n--- Epoch {epoch+1}/{EPOCHS} ---")
         
         # Entrenamiento
-        train_loss = train_epoch(
+        train_loss, train_f1, train_iou = train_epoch(
             model, dataloader_train, optimizer, scaler, 
             device, criterion, accum_steps=4
         )
@@ -296,12 +229,19 @@ def main():
         
         epoch_metrics = {
             'epoch': epoch + 1,
-            'train_loss': float(train_loss),
-            'val_loss': float(val_loss),
-            'f1': float(current_f1),
-            'iou': float(current_iou),
+            'train': {
+                'loss': float(train_loss),
+                'f1': float(train_f1),
+                'iou': float(train_iou)
+            },
+            'val': {
+                'loss': float(val_loss),
+                'f1': float(current_f1),
+                'iou': float(current_iou)
+            },
             'lr': float(optimizer.param_groups[0]['lr'])
         }
+        history.append(epoch_metrics)
         history.append(epoch_metrics)
         
         with open(history_file, 'w') as f:
