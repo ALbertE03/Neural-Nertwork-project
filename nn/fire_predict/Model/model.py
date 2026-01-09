@@ -28,13 +28,13 @@ class AttentionBlock3D(nn.Module):
         return x * psi
 
 class UNet3D(nn.Module):
-    def __init__(self, in_channels=28, out_channels=1, dropout=0.3):
+    def __init__(self, in_channels=28, out_channels=1, dropout=0.3,enc1_channels=32,enc2_channels=64,bottleneck_channels=256):
         super().__init__()
 
-        # Definimos los canales personalizados
-        enc1_channels = 32
-        enc2_channels = 64
-        bottleneck_channels = 256
+    
+        self.enc1_channels = enc1_channels
+        self.enc2_channels = enc2_channels
+        self.bottleneck_channels = 256
 
         def conv_block(in_c, out_c, norm_c=None):
             # norm_c: canales para la segunda BatchNorm (opcional)
@@ -51,23 +51,22 @@ class UNet3D(nn.Module):
             return nn.Sequential(*layers)
 
         # Encoder
-        self.enc1 = conv_block(in_channels, enc1_channels)
-        self.enc2 = conv_block(enc1_channels, enc2_channels)
+        self.enc1 = conv_block(in_channels, self.enc1_channels)
+        self.enc2 = conv_block(self.enc1_channels, self.enc2_channels)
         self.pool = nn.MaxPool3d(kernel_size=(1, 2, 2)) # Reduce H, W but NOT time
 
         # Bottleneck
-        self.bottleneck = conv_block(enc2_channels, bottleneck_channels)
+        self.bottleneck = conv_block(self.enc2_channels, self.bottleneck_channels)
 
         # Decoder
         self.up2 = nn.Upsample(scale_factor=(1, 2, 2), mode='trilinear', align_corners=True)
-        self.att2 = AttentionBlock3D(F_g=bottleneck_channels, F_l=enc2_channels, F_int=enc2_channels)
-        self.dec2 = conv_block(bottleneck_channels + enc2_channels, enc2_channels)
+        self.att2 = AttentionBlock3D(F_g=self.bottleneck_channels, F_l=self.enc2_channels, F_int=self.enc2_channels)
+        self.dec2 = conv_block(self.bottleneck_channels + self.enc2_channels, self.enc2_channels)
 
         self.up1 = nn.Upsample(scale_factor=(1, 2, 2), mode='trilinear', align_corners=True)
-        self.att1 = AttentionBlock3D(F_g=enc2_channels, F_l=enc1_channels, F_int=enc1_channels)
-        self.dec1 = conv_block(enc2_channels + enc1_channels, enc1_channels)
-
-        self.final = nn.Conv3d(enc1_channels, out_channels, kernel_size=1)
+        self.att1 = AttentionBlock3D(F_g=self.enc2_channels, F_l=self.enc1_channels, F_int=self.enc1_channels)
+        self.dec1 = conv_block(self.enc2_channels + self.enc1_channels, self.enc1_channels)
+        self.final = nn.Conv3d(self.enc1_channels, out_channels, kernel_size=1)
         
     def forward(self, x):
         # x: (B, T, C, H, W) -> (B, C, T, H, W)
