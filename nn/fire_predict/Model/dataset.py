@@ -79,7 +79,7 @@ class TSDatasetROI(Dataset):
             return rois
 
         num_to_pick = min(self.max_rois, len(ys))
-        idx = np.random.choice(len(ys), num_to_pick, replace=False)
+        idx = np.random.choice(len(ys), num_to_pick, replace=True)
         rois = []
         for i in idx:
             y, x = ys[i], xs[i]
@@ -189,14 +189,7 @@ class TSDatasetROI(Dataset):
                     seq_x.append(np.concatenate([day, fire[None, ...], night, firep], axis=0))
                     seq_y.append(fire)
 
-            # LULC
-            with rasterio.open(lulc_p) as lsrc:
-                scale_y, scale_x = lsrc.height / base_h, lsrc.width / base_w
-                l_cy, l_cx = int(cy * scale_y), int(cx * scale_x)
-                lulc_croped = read_with_padding(lsrc, l_cy, l_cx)
-                for t in range(len(seq_x)):
-                    seq_x[t] = np.concatenate([seq_x[t], lulc_croped], axis=0)
-
+            
             # Padding Temporal
             t_len = len(seq_x)
             if t_len < needed:
