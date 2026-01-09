@@ -53,7 +53,7 @@ class UNet3D(nn.Module):
         # Encoder
         self.enc1 = conv_block(in_channels, self.enc1_channels)
         self.enc2 = conv_block(self.enc1_channels, self.enc2_channels)
-        self.pool = nn.MaxPool3d(kernel_size=(1, 2, 2)) # Reduce H, W but NOT time
+        self.pool = nn.MaxPool3d(kernel_size=(1, 2, 2)) # Reduce H, W  
 
         # Bottleneck
         self.bottleneck = conv_block(self.enc2_channels, self.bottleneck_channels)
