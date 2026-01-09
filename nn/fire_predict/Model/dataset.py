@@ -1,244 +1,182 @@
 import os
-import random
 import torch
 import numpy as np
 import rasterio
-from rasterio.windows import Window
+import json
 from torch.utils.data import Dataset
 from pathlib import Path
-from constants import MAX_INPUT_SEQ_LEN, PRED_SEQ_LEN
-class TSDatasetROI(Dataset):
+from tqdm import tqdm
+from rasterio.warp import reproject, Resampling
+
+class TSDatasetSequences(Dataset):
     def __init__(
         self,
         path_valid,
         cache_dir,
         train=False,
         augment=False,
-        crop_size=192,
-        max_rois=5,
-        augment_factor=4  
+        crop_size=128,
+        seq_len=6,
+        stride_t=6,
+        TARGET_SIZE=512,
+        force_rebuild=False
     ):
         self.train = train
         self.augment = augment
         self.crop_size = crop_size
-        self.max_rois = max_rois
-        self.augment_factor = augment_factor if train else 1
-
-        self.image_paths = self._find_tiff_files(path_valid)
+        self.seq_len = seq_len
+        self.stride_t = stride_t
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.TARGET_SIZE = TARGET_SIZE
+        
+        self.catalog_path = self.cache_dir / f"catalog_s{seq_len}_st{stride_t}_c{crop_size}_overlap.json"
+        self.raw_paths = self._find_tiff_files(path_valid)
+
+        if self.catalog_path.exists() and not force_rebuild:
+            print(f"Cargando catálogo desde {self.catalog_path}...")
+            with open(self.catalog_path, 'r') as f:
+                self.samples = json.load(f)
+        else:
+            print("Generando catálogo con 4 bloques solapados...")
+            self.samples = self._create_sequence_catalog()
+            with open(self.catalog_path, 'w') as f:
+                json.dump(self.samples, f)
+        
+        print(f"Dataset listo: {len(self.samples)} parches (4 por cada bloque 512).")
 
     def _find_tiff_files(self, paths):
         r = {}
-        idx = 0
-        for base in paths:
+        for idx, base in enumerate(paths):
             r[idx] = {k: [] for k in ["ESRI_LULC", "FirePred", "VIIRS_Day", "VIIRS_Night"]}
             for folder in os.listdir(base):
                 p = Path(base, folder)
-                if p.is_dir():
-                    for tif in p.rglob("*.tif"):
-                        if folder in r[idx]:
-                            r[idx][folder].append(tif)
-            for k in r[idx]:
-                r[idx][k] = sorted(r[idx][k], key=lambda x: x.name)
-            idx += 1
+                if p.is_dir() and folder in r[idx]:
+                    r[idx][folder] = sorted(list(p.rglob("*.tif")), key=lambda x: x.name)
         return r
 
-    def __len__(self):
-        return len(self.image_paths) * self.augment_factor
+    def _create_sequence_catalog(self):
+        catalog = []
+   
+        p1 = 0
+        p2 = 512 - 128 
+
+        p2_overlap = 350 
+
+        for region_idx, folders in tqdm(self.raw_paths.items()):
+            num_days = min(len(folders["VIIRS_Day"]), len(folders["VIIRS_Night"]), len(folders["FirePred"]))
+
+            for t_start in range(0, num_days - self.seq_len + 1, self.stride_t):
+                block_id = f"reg{region_idx}_t{t_start}_full512"              
+                quadrants = [
+                    (p1, p1),                 # Top-Left
+                    (p1, p2_overlap),         # Top-Right
+                    (p2_overlap, p1),         # Bottom-Left
+                    (p2_overlap, p2_overlap)  # Bottom-Right
+                ]
+
+                for i, (y0, x0) in enumerate(quadrants):
+                    catalog.append({
+                        'region': region_idx,
+                        't_start': t_start,
+                        'y_offset': y0,
+                        'x_offset': x0,
+                        'block_id': block_id,
+                        'sample_id': f"reg{region_idx}_t{t_start}_q{i}"
+                    })
+        return catalog
+
+    def _read_reproject_to_ref(self, src, ref_src, window, resampling, bands=None):
+        count = len(bands) if bands is not None else src.count
+        out = np.zeros((count, self.TARGET_SIZE, self.TARGET_SIZE), dtype=np.float32)
+        
+        dst_transform = rasterio.transform.from_bounds(
+            *rasterio.windows.bounds(window, ref_src.transform),
+            width=self.TARGET_SIZE,
+            height=self.TARGET_SIZE
+        )
+
+        source_bands = rasterio.band(src, bands if bands is not None else list(range(1, src.count + 1)))
+        
+        reproject(
+            source=source_bands,
+            destination=out,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=ref_src.crs,
+            resampling=resampling
+        )
+        return out
+
+    def _load_and_process_full_block(self, info):
+        region = self.raw_paths[info['region']]
+        t_range = slice(info['t_start'], info['t_start'] + self.seq_len)
+        
+        seq_x, seq_y = [], []
+        for dp, np_, fp in zip(region["VIIRS_Day"][t_range], 
+                                region["VIIRS_Night"][t_range], 
+                                region["FirePred"][t_range]):
+            
+            with rasterio.open(dp) as dsrc:
+                # Proyectamos la imagen original COMPLETA a 512x512
+                full_win = rasterio.windows.Window(0, 0, dsrc.width, dsrc.height)
+                
+                day = self._normalize(self._read_reproject_to_ref(dsrc, dsrc, full_win, Resampling.bilinear, bands=list(range(1,7))))
+                fire = self._normalize(self._read_reproject_to_ref(dsrc, dsrc, full_win, Resampling.nearest, bands=[7]), is_label=True)
+                
+                with rasterio.open(np_) as nsrc:
+                    night = self._normalize(self._read_reproject_to_ref(nsrc, dsrc, full_win, Resampling.bilinear, bands=[1,2]))
+                
+                with rasterio.open(fp) as fsrc:
+                    firep = self._normalize(self._read_reproject_to_ref(fsrc, dsrc, full_win, Resampling.bilinear))
+
+                x_combined = np.concatenate([day, fire, night, firep], axis=0)
+                seq_x.append(x_combined)
+                seq_y.append(fire.squeeze(0))
+
+        return np.stack(seq_x), np.stack(seq_y)
 
     def _normalize(self, x, is_label=False):
         x = np.nan_to_num(x, nan=0.0)
         if is_label:
-            x[x < 0] = 0.0
             return np.clip(x, 0.0, 1.0)
-        
-        x[x < -100] = 0.0
+        # Normalización por canal
         for c in range(x.shape[0]):
-            vmin, vmax = x[c].min(), x[c].max()
-            if vmax - vmin > 1e-6:
-                x[c] = (x[c] - vmin) / (vmax - vmin)
+            m = x[c].max() - x[c].min()
+            if m > 1e-6:
+                x[c] = (x[c] - x[c].min()) / m
         return x
 
-    def _find_rois(self, label_paths):
-        acc = None
-        for p in label_paths:
-            with rasterio.open(p) as src:
-                fire = src.read(src.count - 1)  
-                fire = (np.nan_to_num(fire) > 0).astype(np.float32)
-                acc = fire if acc is None else acc + fire
-
-        ys, xs = np.where(acc > 0)
-        if len(ys) == 0:
-            h, w = acc.shape
-            rois = []
-            for _ in range(self.max_rois):
-                roi_y = np.random.randint(0, h - self.crop_size + 1)
-                roi_x = np.random.randint(0, w - self.crop_size + 1)
-                rois.append((roi_y, roi_x))
-            return rois
-
-        num_to_pick = min(self.max_rois, len(ys))
-        idx = np.random.choice(len(ys), num_to_pick, replace=True)
-        rois = []
-        for i in idx:
-            y, x = ys[i], xs[i]
-            # Permitir que el fuego esté en cualquier parte del parche
-            min_y = max(0, y - self.crop_size + 1)
-            max_y = min(y, acc.shape[0] - self.crop_size)
-            min_x = max(0, x - self.crop_size + 1)
-            max_x = min(x, acc.shape[1] - self.crop_size)
-            if max_y < min_y: min_y, max_y = max_y, min_y
-            if max_x < min_x: min_x, max_x = max_x, min_x
-            roi_y = np.random.randint(min_y, max_y + 1) if max_y >= min_y else y
-            roi_x = np.random.randint(min_x, max_x + 1) if max_x >= min_x else x
-            rois.append((roi_y, roi_x))
-        return rois
-
-    def _apply_augmentation(self, x, y):
-        """
-        Aplica rotaciones de 90 grados y flips de forma aleatoria.
-        x: (ROIs, T, C, H, W)
-        y: (ROIs, T, H, W)
-        """
-        # Rotación aleatoria (0, 90, 180, 270 grados)
-        p = random.random()
-        if p>0.5:
-            k = random.choice([1, 2, 3])  
-            x = np.rot90(x, k=k, axes=(-2, -1))
-            y = np.rot90(y, k=k, axes=(-2, -1))
-
-        # Flip aleatorio
-        f = random.choice([None, 'horizontal', 'vertical'])
-        if f == 'horizontal':
-            x = np.flip(x, axis=-1)
-            y = np.flip(y, axis=-1)
-        elif f == 'vertical':
-            x = np.flip(x, axis=-2)
-            y = np.flip(y, axis=-2)
-
-        return x.copy(), y.copy()
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        # Mapeo de índice virtual a real
-        real_idx = idx % len(self.image_paths)
-        is_augmented_instance = idx >= len(self.image_paths)
-        
-        paths = self.image_paths[real_idx]
-        needed = MAX_INPUT_SEQ_LEN + PRED_SEQ_LEN
-        
-        def last_n(l): return l[-needed:] if len(l) > needed else l
-        
-        day_p = last_n(paths["VIIRS_Day"])
-        night_p = last_n(paths["VIIRS_Night"])
-        firep_p = last_n(paths["FirePred"])
-        lulc_p = paths["ESRI_LULC"][0]
-        
-        centers = self._find_rois(day_p)
-        half = self.crop_size // 2
-        
-        with rasterio.open(day_p[0]) as ref_src:
-            base_h, base_w = ref_src.height, ref_src.width
-
-        
-        def read_with_padding(src, cy, cx, is_fire_label=False):
-            y1_s = max(0, cy - half)
-            x1_s = max(0, cx - half)
-            read_w = max(0, min(self.crop_size, src.width - x1_s))
-            read_h = max(0, min(self.crop_size, src.height - y1_s))
-            
-            win_s = Window(x1_s, y1_s, read_w, read_h)
-            data = src.read(window=win_s)
-            
-            pad_y = self.crop_size - read_h
-            pad_x = self.crop_size - read_w
-            
-            if is_fire_label:
-                if data.ndim == 3: data = data[-1]
-                pad_shape = [(0, pad_y), (0, pad_x)]
-            else:
-                pad_shape = [(0, 0), (0, pad_y), (0, pad_x)]
-                
-            if pad_y > 0 or pad_x > 0:
-                data = np.pad(data, pad_shape, mode='constant', constant_values=0)
-            return data
-
-        xs_roi, ys_roi = [], []
-
-        for roi_id, (cy, cx) in enumerate(centers):
-            cache_f = self._cache_file(real_idx, roi_id)
-            
-            if cache_f.exists():
-                try:
-                    data = np.load(cache_f)
-                    xs_roi.append(data["x"])
-                    ys_roi.append(data["y"])
-                    continue
-                except: pass
-
-            seq_x, seq_y = [], []
-            for dp, np_, fp in zip(day_p, night_p, firep_p):
-                with rasterio.open(dp) as dsrc, rasterio.open(np_) as nsrc, rasterio.open(fp) as fsrc:
-                    day_full = read_with_padding(dsrc, cy, cx)
-                    day = self._normalize(day_full[:-2])
-                   
-                    fire = self._normalize(day_full[6], is_label=True)
-                    night = self._normalize(read_with_padding(nsrc, cy, cx)[-2:])
-                    firep = self._normalize(read_with_padding(fsrc, cy, cx))
-
-                    seq_x.append(np.concatenate([day, fire[None, ...], night, firep], axis=0))
-                    seq_y.append(fire)
-
-            
-            # Padding Temporal
-            t_len = len(seq_x)
-            if t_len < needed:
-                zeros_x = np.zeros((seq_x[0].shape[0], self.crop_size, self.crop_size))
-                zeros_y = np.zeros((self.crop_size, self.crop_size))
-                seq_x += [zeros_x] * (needed - t_len)
-                seq_y += [zeros_y] * (needed - t_len)
-
-            x_stack, y_stack = np.stack(seq_x), np.stack(seq_y)
-            np.savez_compressed(cache_f, x=x_stack, y=y_stack)
-            xs_roi.append(x_stack)
-            ys_roi.append(y_stack)
-
-        # Convertir a Tensores
-        xs_final = np.stack(xs_roi) # (NumROIs, T, C, H, W)
-        ys_final = np.stack(ys_roi) # (NumROIs, T, H, W)
-
-        #  aumentación 
-        if self.augment:
-            xs_final, ys_final = self._apply_augmentation(xs_final, ys_final)
-
-        return torch.from_numpy(xs_final).float(), torch.from_numpy(ys_final).float()
-
-    def _cache_file(self, idx, roi_id):
-        return self.cache_dir / f"sample_{idx:05d}_roi_{roi_id}.npz"
-
-def collate_fn(batch):
-    x, y = zip(*batch)
+        info = self.samples[idx]
+        cache_f = self.cache_dir / f"{info['sample_id']}.npz"
     
-
-    x = [xx.squeeze(0) if xx.ndim == 6 else xx for xx in x]
-    y = [yy.squeeze(0) if yy.ndim == 5 else yy for yy in y]
-
-    max_rois = max([xx.shape[0] for xx in x])
+        # Si el parche específico no existe, generamos los 4 de esa secuencia
+        if not cache_f.exists():
+            self._process_and_save_all_quadrants(info)
     
-    x_pad, y_pad = [], []
-    for xx, yy in zip(x, y):
-        pad_n = max_rois - xx.shape[0]
-        if pad_n > 0:
+        # Cargar solo el parche pequeño de 128x128
+        data = np.load(cache_f)
+        return torch.from_numpy(data["x"]).float(), torch.from_numpy(data["y"]).float()
 
-            xx_padded = torch.cat([xx, torch.zeros(pad_n, *xx.shape[1:])], dim=0)
-            yy_padded = torch.cat([yy, torch.zeros(pad_n, *yy.shape[1:])], dim=0)
-            x_pad.append(xx_padded)
-            y_pad.append(yy_padded)
-        else:
-            x_pad.append(xx)
-            y_pad.append(yy)
+    def _process_and_save_all_quadrants(self, info):
+        # 1. Cargamos el bloque de 512 completo (reproyección lenta)
+        x_block, y_block = self._load_and_process_full_block(info)
+        
+        # 2. Definimos otra vez las coordenadas (deben coincidir con el catálogo)
+        p1, p2_overlap = 0, 350
+        quadrants = [(p1, p1), (p1, p2_overlap), (p2_overlap, p1), (p2_overlap, p2_overlap)]
+        
+        # 3. Cortamos y guardamos cada uno por separado
+        for i, (y0, x0) in enumerate(quadrants):
+            x_patch = x_block[:, :, y0:y0+128, x0:x0+128]
+            y_patch = y_block[:, y0:y0+128, x0:x0+128]
             
-    return {
-        'x': torch.stack(x_pad),      # (B, max_rois, T, C, H, W)
-        'label': torch.stack(y_pad)   # (B, max_rois, T, H, W)
-    }
+            # Guardamos con el ID que el catálogo espera
+            patch_id = f"reg{info['region']}_t{info['t_start']}_q{i}"
+            path = self.cache_dir / f"{patch_id}.npz"
+            np.savez_compressed(path, x=x_patch, y=y_patch)

@@ -37,7 +37,6 @@ class UNet3D(nn.Module):
         self.bottleneck_channels = bottleneck_channels
 
         def conv_block(in_c, out_c, norm_c=None):
-            # norm_c: canales para la segunda BatchNorm (opcional)
             layers = [
                 nn.Conv3d(in_c, out_c, kernel_size=3, padding=1),
                 nn.BatchNorm3d(out_c),
@@ -67,6 +66,7 @@ class UNet3D(nn.Module):
         self.att1 = AttentionBlock3D(F_g=self.enc2_channels, F_l=self.enc1_channels, F_int=self.enc1_channels)
         self.dec1 = conv_block(self.enc2_channels + self.enc1_channels, self.enc1_channels)
         self.final = nn.Conv3d(self.enc1_channels, out_channels, kernel_size=1)
+        self.temporal_compressor = nn.Conv3d(out_channels, out_channels, kernel_size=(5, 1, 1))
         
     def forward(self, x):
         # x: (B, T, C, H, W) -> (B, C, T, H, W)
@@ -87,25 +87,5 @@ class UNet3D(nn.Module):
         d1 = self.dec1(d1)
         
         out = self.final(d1)
-        return out[:, :, -1, :, :] # Output for time T
-
-
-
-class FireModelROI(nn.Module):
-    def __init__(self, unet_3d):
-        super().__init__()
-        self.unet = unet_3d
-
-    def forward(self, x):
-        # (B, R, T, C, H, W) 
-        b, r, t, c, h, w = x.shape
-        
-        # Nueva forma: (B*R, T, C, H, W) 
-        x = x.view(b * r, t, c, h, w)
-        
-
-        out = self.unet(x) #(B*R, 1, H, W)
-        
-        # Final: (B, R, 1, H, W) 
-        out = out.view(b, r, 1, h, w)
-        return out
+        out = self.temporal_compressor(out) 
+        return out.squeeze(2) 

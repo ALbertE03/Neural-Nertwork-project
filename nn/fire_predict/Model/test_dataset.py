@@ -88,7 +88,6 @@ class TSDatasetTest(Dataset):
         return torch.from_numpy(x_stack).float()
 
 if __name__ == "__main__":
-    # Rutas de ejemplo
     path_valid = ['']
     cache_dir = "cache_test"
     dataset = TSDatasetTest(path_valid, cache_dir)

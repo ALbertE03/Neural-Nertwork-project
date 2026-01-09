@@ -7,8 +7,8 @@ from model import UNet3D, FireModelROI
 from train import SoftZoneLoss
 from sklearn.metrics import roc_curve, auc, recall_score
 
-def load_checkpoint_test(model, optimizer, scheduler, path):
-    checkpoint = torch.load(path, map_location="cpu")
+def load_checkpoint_test(model, optimizer, scheduler, path,device='cpu'):
+    checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -78,7 +78,7 @@ def main():
     model = FireModelROI(base_unet).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)
-    load_checkpoint_test(model, optimizer, scheduler, 'saved/checkpoints/checkpoint1.pth')
+    load_checkpoint_test(model, optimizer, scheduler, 'saved/checkpoints/checkpoint1.pth', device=device)
     path_valid = [""]
     cache_dir = "cache_test"
     dataset = TSDatasetTest(path_valid, cache_dir)
