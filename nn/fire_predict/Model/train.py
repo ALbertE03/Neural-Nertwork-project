@@ -72,7 +72,7 @@ def validate_zonal(model, loader, device, criterion, epoch=0):
             all_preds.append(preds_bin.flatten())
             all_targets.append(targets_np.flatten())
 
-            # --- VISUALIZACIÓN CADA 5 BATCHES ---
+            
             """if i % 5 == 0:
                 # Tomamos el primer ROI del primer ejemplo del batch
                 img_real = targets_np[0, 0, 0]
@@ -103,7 +103,6 @@ def validate_zonal(model, loader, device, criterion, epoch=0):
                 plt.tight_layout()
                 plt.show()"""
 
-    # Concatenamos todo para métricas globales precisas
     y_true = np.concatenate(all_targets)
     y_pred = np.concatenate(all_preds)
     
