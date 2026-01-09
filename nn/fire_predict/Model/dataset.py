@@ -67,15 +67,33 @@ class TSDatasetROI(Dataset):
                 fire = src.read(src.count - 1)  
                 fire = (np.nan_to_num(fire) > 0).astype(np.float32)
                 acc = fire if acc is None else acc + fire
-        
+
         ys, xs = np.where(acc > 0)
         if len(ys) == 0:
             h, w = acc.shape
-            return [(h // 2, w // 2)]
-        
+            rois = []
+            for _ in range(self.max_rois):
+                roi_y = np.random.randint(0, h - self.crop_size + 1)
+                roi_x = np.random.randint(0, w - self.crop_size + 1)
+                rois.append((roi_y, roi_x))
+            return rois
+
         num_to_pick = min(self.max_rois, len(ys))
         idx = np.random.choice(len(ys), num_to_pick, replace=False)
-        return list(zip(ys[idx], xs[idx]))
+        rois = []
+        for i in idx:
+            y, x = ys[i], xs[i]
+            # Permitir que el fuego esté en cualquier parte del parche
+            min_y = max(0, y - self.crop_size + 1)
+            max_y = min(y, acc.shape[0] - self.crop_size)
+            min_x = max(0, x - self.crop_size + 1)
+            max_x = min(x, acc.shape[1] - self.crop_size)
+            if max_y < min_y: min_y, max_y = max_y, min_y
+            if max_x < min_x: min_x, max_x = max_x, min_x
+            roi_y = np.random.randint(min_y, max_y + 1) if max_y >= min_y else y
+            roi_x = np.random.randint(min_x, max_x + 1) if max_x >= min_x else x
+            rois.append((roi_y, roi_x))
+        return rois
 
     def _apply_augmentation(self, x, y):
         """
