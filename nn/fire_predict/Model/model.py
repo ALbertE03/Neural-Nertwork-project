@@ -1,91 +1,85 @@
-import torch.nn as nn
-import torch
-    
-class AttentionBlock3D(nn.Module):
-    """Attention Gate for 3D UNet."""
-    def __init__(self, F_g, F_l, F_int):
-        super().__init__()
-        self.W_g = nn.Sequential(
-            nn.Conv3d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm3d(F_int)
-        )
-        self.W_x = nn.Sequential(
-            nn.Conv3d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm3d(F_int)
-        )
-        self.psi = nn.Sequential(
-            nn.Conv3d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm3d(1),
-            nn.Sigmoid()
-        )
-        self.relu = nn.ReLU(inplace=True)
+import tensorflow as tf
+from tensorflow.keras import layers, models
 
-    def forward(self, g, x):
+class AttentionBlock3D(layers.Layer):
+    """Attention Gate para 3D UNet en TensorFlow."""
+    def __init__(self, F_int, **kwargs):
+        super().__init__(**kwargs)
+        self.W_g = models.Sequential([
+            layers.Conv3D(F_int, kernel_size=1, strides=1, padding='same', use_bias=True),
+            layers.BatchNormalization()
+        ])
+        self.W_x = models.Sequential([
+            layers.Conv3D(F_int, kernel_size=1, strides=1, padding='same', use_bias=True),
+            layers.BatchNormalization()
+        ])
+        self.psi = models.Sequential([
+            layers.Conv3D(1, kernel_size=1, strides=1, padding='same', use_bias=True),
+            layers.BatchNormalization(),
+            layers.Activation('sigmoid')
+        ])
+
+    def call(self, g, x):
         g1 = self.W_g(g)
         x1 = self.W_x(x)
-        psi = self.relu(g1 + x1)
+        psi = layers.Activation('relu')(g1 + x1)
         psi = self.psi(psi)
         return x * psi
 
-class UNet3D(nn.Module):
-    def __init__(self, in_channels=28, out_channels=1, dropout=0.3,enc1_channels=32,enc2_channels=64,bottleneck_channels=256):
-        super().__init__()
-
+def conv_block(x, out_c, dropout_rate):
+    """Bloque de doble convolución 3D."""
+    x = layers.Conv3D(out_c, kernel_size=3, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.Dropout(dropout_rate)(x)
     
-        self.enc1_channels = enc1_channels
-        self.enc2_channels = enc2_channels
-        self.bottleneck_channels = bottleneck_channels
+    x = layers.Conv3D(out_c, kernel_size=3, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.Dropout(dropout_rate)(x)
+    return x
 
-        def conv_block(in_c, out_c, norm_c=None):
-            layers = [
-                nn.Conv3d(in_c, out_c, kernel_size=3, padding=1),
-                nn.BatchNorm3d(out_c),
-                nn.ReLU(inplace=True),
-                nn.Dropout3d(p=dropout),
-                nn.Conv3d(out_c, out_c, kernel_size=3, padding=1),
-                nn.BatchNorm3d(norm_c if norm_c is not None else out_c),
-                nn.ReLU(inplace=True),
-                nn.Dropout3d(p=dropout)
-            ]
-            return nn.Sequential(*layers)
+def build_unet3d(input_shape=(3, 256, 256, 28), out_channels=1, dropout=0.3):
+    # Dimensiones: (Tiempo, Alto, Ancho, Canales)
+    inputs = layers.Input(shape=input_shape)
 
-        # Encoder
-        self.enc1 = conv_block(in_channels, self.enc1_channels)
-        self.enc2 = conv_block(self.enc1_channels, self.enc2_channels)
-        self.pool = nn.MaxPool3d(kernel_size=(1, 2, 2)) # Reduce H, W  
+    # Encoder
+    # Nivel 1
+    e1 = conv_block(inputs, 32, dropout)
+    # MaxPool3D: Solo reducimos H y W (1, 2, 2) igual que en tu PyTorch
+    p1 = layers.MaxPooling3D(pool_size=(1, 2, 2))(e1)
+    
+    # Nivel 2
+    e2 = conv_block(p1, 64, dropout)
+    p2 = layers.MaxPooling3D(pool_size=(1, 2, 2))(e2)
 
-        # Bottleneck
-        self.bottleneck = conv_block(self.enc2_channels, self.bottleneck_channels)
+    # Bottleneck
+    b = conv_block(p2, 256, dropout)
 
-        # Decoder
-        self.up2 = nn.Upsample(scale_factor=(1, 2, 2), mode='trilinear', align_corners=True)
-        self.att2 = AttentionBlock3D(F_g=self.bottleneck_channels, F_l=self.enc2_channels, F_int=self.enc2_channels)
-        self.dec2 = conv_block(self.bottleneck_channels + self.enc2_channels, self.enc2_channels)
+    # Decoder
+    # Up 2
+    u2 = layers.UpSampling3D(size=(1, 2, 2))(b)
+    # Atención 2: g es la señal del decoder, x es la skip connection
+    att2 = AttentionBlock3D(F_int=64)(g=u2, x=e2)
+    d2 = layers.Concatenate()([u2, att2])
+    d2 = conv_block(d2, 64, dropout)
 
-        self.up1 = nn.Upsample(scale_factor=(1, 2, 2), mode='trilinear', align_corners=True)
-        self.att1 = AttentionBlock3D(F_g=self.enc2_channels, F_l=self.enc1_channels, F_int=self.enc1_channels)
-        self.dec1 = conv_block(self.enc2_channels + self.enc1_channels, self.enc1_channels)
-        self.final = nn.Conv3d(self.enc1_channels, out_channels, kernel_size=1)
-        self.temporal_compressor = nn.Conv3d(out_channels, out_channels, kernel_size=(5, 1, 1))
-        
-    def forward(self, x):
-        # x: (B, T, C, H, W) -> (B, C, T, H, W)
-        x = x.permute(0, 2, 1, 3, 4)
-        
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        b = self.bottleneck(self.pool(e2))
-        
-        d2 = self.up2(b)
-        e2_att = self.att2(g=d2, x=e2)
-        d2 = torch.cat([d2, e2_att], dim=1) # Attention-based skip connection
-        d2 = self.dec2(d2)
-        
-        d1 = self.up1(d2)
-        e1_att = self.att1(g=d1, x=e1)
-        d1 = torch.cat([d1, e1_att], dim=1) # Attention-based skip connection
-        d1 = self.dec1(d1)
-        
-        out = self.final(d1)
-        out = self.temporal_compressor(out) 
-        return out.squeeze(2) 
+    # Up 1
+    u1 = layers.UpSampling3D(size=(1, 2, 2))(d2)
+    # Atención 1
+    att1 = AttentionBlock3D(F_int=32)(g=u1, x=e1)
+    d1 = layers.Concatenate()([u1, att1])
+    d1 = conv_block(d1, 32, dropout)
+
+    # Salida Final
+    out = layers.Conv3D(out_channels, kernel_size=1)(d1)
+    
+    # Temporal Compressor: Reduce la dimensión T de 3 a 1
+    # Usamos padding='valid' para que el kernel de 3 reduzca (3, H, W) -> (1, H, W)
+    out = layers.Conv3D(out_channels, kernel_size=(3, 1, 1), padding='valid')(out)
+    
+    # Squeeze: En TF usamos Reshape o Lambda para quitar la dimensión temporal
+    # De (Batch, 1, 256, 256, 1) -> (Batch, 256, 256, 1)
+    out = layers.Reshape((input_shape[1], input_shape[2], out_channels))(out)
+
+    return models.Model(inputs, out, name="UNet3D_Attention")
