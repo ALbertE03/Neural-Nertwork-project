@@ -3,32 +3,40 @@ import os
 import json
 
 from tensorflow.keras import mixed_precision
-class BCEDiceLoss(tf.keras.losses.Loss):
-    def __init__(self, smooth=1e-6, name="bce_dice_loss"):
-        super().__init__(name=name)
+class TverskyBCELoss(tf.keras.losses.Loss):
+    def __init__(self, alpha=0.8, beta=0.2, smooth=1.0, pos_weight=2.0):
+        super().__init__()
+        self.alpha = alpha  
+        self.beta = beta    
         self.smooth = smooth
-        self.bce = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+        self.pos_weight = pos_weight
 
     def call(self, y_true, y_pred):
-        # BCE Loss
-        bce_loss = self.bce(y_true, y_pred)
-        
-        # Dice Loss
+        # Weighted BCE
+        bce = tf.nn.weighted_cross_entropy_with_logits(y_true, y_pred, self.pos_weight)
+        bce_loss = tf.reduce_mean(bce)
+
+        #  Tversky Loss
         y_pred_prob = tf.nn.sigmoid(y_pred)
-        y_true_f = tf.reshape(y_true, [-1])
-        y_pred_f = tf.reshape(y_pred_prob, [-1])
-        
-        intersection = tf.reduce_sum(y_true_f * y_pred_f)
-        dice_loss = 1 - (2. * intersection + self.smooth) / (
-            tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + self.smooth
-        )
-        
-        return bce_loss + dice_loss
+        y_true_f = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
+        y_pred_f = tf.cast(tf.reshape(y_pred_prob, [-1]), tf.float32)
+
+        tp = tf.reduce_sum(y_true_f * y_pred_f)
+        fn = tf.reduce_sum(y_true_f * (1 - y_pred_f))
+        fp = tf.reduce_sum((1 - y_true_f) * y_pred_f)
+
+        tversky_index = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+        tversky_loss = 1.0 - tversky_index
+
+        # 0.5 * BCE (Estabilidad píxel a píxel) 
+        # + 1.5 * Tversky (Fuerza el Recall y la forma del incendio)
+        return (0.5 * bce_loss) + (1.5 * tversky_loss)
+
 policy = mixed_precision.Policy('mixed_float16')
 mixed_precision.set_global_policy(policy)
 
-print('Compute dtype: %s' % policy.compute_dtype)
-print('Variable dtype: %s' % policy.variable_dtype)
+print('Compute dtype: ',policy.compute_dtype)
+print('Variable dtype: ',policy.variable_dtype)
 
 class SaveHistoryCallback(tf.keras.callbacks.Callback):
     def __init__(self, filepath):
@@ -39,12 +47,11 @@ class SaveHistoryCallback(tf.keras.callbacks.Callback):
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
         lr = float(self.model.optimizer.learning_rate.numpy())
-        
+
         current_logs = {
             "epoch": epoch + 1,
             "lr": lr,
-            **{k: float(v) for k, v in logs.items()} 
-        }
+        **{k: float(v) for k, v in logs.items()}}
         self.history_dict.append(current_logs)
         
         with open(self.filepath, 'w') as f:
@@ -52,80 +59,93 @@ class SaveHistoryCallback(tf.keras.callbacks.Callback):
 
 
 def main():
-    batch_size = 8  
+    batch_size = 32
     epochs = 50
-    
-    last_checkpoint_path = 'saved/checkpoints/last_model1.weights.h5' 
-    best_checkpoint_path = 'saved/checkpoints/best_fire_model1.weights.h5' 
-    history_path = 'training_history.json'
-    
+
+    last_checkpoint_path = 'saved/checkpoints/last_model3.weights.h5'
+    best_checkpoint_path = 'saved/checkpoints/best_fire_model3.weights.h5'
+    history_path = 'training_history3.json'
+
     steps_per_epoch = len(train_dataset) // batch_size
     validation_steps = len(val_dataset) // batch_size
 
-    
     model = build_unet3d(input_shape=(3, 256, 256, 28))
-    
-    
+
     initial_epoch = 0
+    best_val_iou = -1.0
     history_cb = SaveHistoryCallback(history_path)
 
+    if os.path.exists(history_path):
+        with open(history_path, 'r') as f:
+            saved_history = json.load(f)
+            history_cb.history_dict = saved_history
+            if saved_history:
+                initial_epoch = saved_history[-1]['epoch']
+                ious = [h.get('val_iou', -1.0) for h in saved_history]
+                best_val_iou = max(ious)
+                print(f"[*] Historial cargado. Mejor val_iou histórico: {best_val_iou:.4f}")
+
     if os.path.exists(last_checkpoint_path):
-        print(f"\n[*] Reanudando desde el último estado: {last_checkpoint_path}")
+        print(f"[*] Reanudando desde pesos: {last_checkpoint_path}")
         model.load_weights(last_checkpoint_path)
-        
-        if os.path.exists(history_path):
-            with open(history_path, 'r') as f:
-                saved_history = json.load(f)
-                history_cb.history_dict = saved_history
-                if saved_history:
-                    initial_epoch = saved_history[-1]['epoch']
-                    print(f"[*] Continuando desde la época {initial_epoch}")
     elif os.path.exists(best_checkpoint_path):
-        print(f"\n[*] No hay 'last_model', pero cargando 'best_fire_model' para no empezar de cero.")
+        print("[*] Usando mejor modelo previo.")
         model.load_weights(best_checkpoint_path)
 
     model.compile(
-        optimizer=tf.keras.optimizers.AdamW(learning_rate=3e-4, clipnorm=1.0),
-        loss=BCEDiceLoss(),
-        metrics=[tf.keras.metrics.BinaryIoU(target_class_ids=[1], name="iou")]
+        optimizer=tf.keras.optimizers.Adam(
+            learning_rate=1e-4,
+            clipnorm=1.0
+        ),
+        loss=TverskyBCELoss(),
+        metrics=[tf.keras.metrics.BinaryIoU(
+            target_class_ids=[1],
+            name="iou"
+        ),tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall")]
     )
 
+    best_ckpt_callback = tf.keras.callbacks.ModelCheckpoint(
+        filepath=best_checkpoint_path,
+        monitor='val_iou',
+        mode='max',
+        save_best_only=True,
+        save_weights_only=True,
+        verbose=1
+    )
+
+    if best_val_iou != -1.0:
+        best_ckpt_callback.best = best_val_iou
 
     callbacks = [
-
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=best_checkpoint_path,
-            monitor='val_iou',
-            mode='max',
-            save_best_only=True,
-            save_weights_only=True,
-            verbose=1
-        ),
-
+        best_ckpt_callback,
         tf.keras.callbacks.ModelCheckpoint(
             filepath=last_checkpoint_path,
-            save_best_only=False, 
+            save_best_only=False,
             save_weights_only=True,
             verbose=1
         ),
-        tf.keras.callbacks.CSVLogger('training_log1.csv', append=True), 
-        tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, verbose=1),
+        tf.keras.callbacks.CSVLogger(
+            'training_log3.csv',
+            append=True
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            verbose=1
+        ),
         history_cb
     ]
 
-    print(f"\nIniciando entrenamiento: Época {initial_epoch + 1} de {epochs}")
-    
+    print(f"\nIniciando entrenamiento: Época {initial_epoch + 1}")
+
     model.fit(
         train_tf_ds,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_tf_ds,
         validation_steps=validation_steps,
         epochs=epochs,
-        initial_epoch=initial_epoch, 
+        initial_epoch=initial_epoch,
         callbacks=callbacks
     )
-
-
-
-if __name__ == "__main__":
-    main() 
