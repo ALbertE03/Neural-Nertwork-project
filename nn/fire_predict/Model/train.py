@@ -25,7 +25,7 @@ class TverskyBCELoss(tf.keras.losses.Loss):
 
         tp = tf.reduce_sum(y_true_f * y_pred_f)
         fn = tf.reduce_sum(y_true_f * (1 - y_pred_f)) # Castigo si no ve el fuego real
-        fp = tf.reduce_sum((1 - y_true_tol_f) * y_pred_f) # Castigo solo si está FUERA de la zona de 2px
+        fp = tf.reduce_sum((1 - y_true_tol_f) * y_pred_f) # Castigo solo si está fuera de la zona de 2px
 
         tversky_index = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
         tversky_loss = 1.0 - tversky_index
