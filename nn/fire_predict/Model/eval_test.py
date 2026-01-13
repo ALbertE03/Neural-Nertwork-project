@@ -17,7 +17,6 @@ if Path(weights_path).exists():
 else:
     print("[!] Error: No se encontraron los pesos.")
 
-# 2. Instanciar Dataset de Inferencia
 ds_inference = InferenceTF(
     path_valid=test,
     cache_dir=cache_base/'test'
@@ -43,12 +42,10 @@ for i in tqdm(range(len(ds_inference))):
     y_pred_probs = pred_512.flatten()
     y_pred_bin = (y_pred_probs > 0.5).astype(np.uint8)
     
-    # --- ACUMULACIÓN GLOBAL ---
-    # Append de las muestras para métricas globales finales
+
     all_y_true.append(y_true_flat)
     all_y_pred.append(y_pred_probs)
 
-    # Métricas individuales (para el reporte CSV y boxplot)
     m = {
         "id": sample_id,
         "f1": f1_score(y_true_flat, y_pred_bin, zero_division=1),
@@ -59,12 +56,11 @@ for i in tqdm(range(len(ds_inference))):
     }
     stats.append(m)
 
-# 1. Convertir acumulados a arrays gigantes de una sola dimensión
+
 all_y_true = np.concatenate(all_y_true)
 all_y_pred = np.concatenate(all_y_pred)
 all_y_pred_bin = (all_y_pred > 0.5).astype(np.uint8)
 
-# 2. Reporte Global (Píxel a Píxel)
 print("\n" + "="*40)
 print("MÉTRICAS GLOBALES (TOTAL DATASET)")
 print("="*40)
@@ -78,16 +74,13 @@ print(f"Global Precision:     {precision_score(all_y_true, all_y_pred_bin):.4f}"
 print(f"Global Recall:        {recall_score(all_y_true, all_y_pred_bin):.4f}")
 print(f"Global AUC-PR:        {global_auc_pr:.4f}")
 
-# 3. Visualización de Resultados Globales
 fig, ax = plt.subplots(1, 2, figsize=(16, 6))
 
-# Matriz de Confusión Global
 cm = confusion_matrix(all_y_true, all_y_pred_bin)
 disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['No Fuego', 'Fuego'])
 disp.plot(ax=ax[0], cmap='Blues', values_format='d')
 ax[0].set_title("Matriz de Confusión Global (Píxeles)")
 
-# Curva PR Global
 ax[1].plot(global_recall, global_precision, color='red', lw=2, label=f'AUC-PR: {global_auc_pr:.4f}')
 ax[1].fill_between(global_recall, global_precision, alpha=0.2, color='red')
 ax[1].set_title("Curva Precision-Recall Global")
@@ -98,6 +91,5 @@ ax[1].legend()
 plt.tight_layout()
 plt.show()
 
-# 4. Exportar y Peores Casos
 df_stats = pd.DataFrame(stats)
 df_stats.to_csv("test_metrics_report_detailed.csv", index=False)

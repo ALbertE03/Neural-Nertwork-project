@@ -6,7 +6,7 @@ import rasterio
 from torch.utils.data import Dataset
 from pathlib import Path
 from tqdm import tqdm
-
+import tensorflow as tf
 class TSDatasetFlat(Dataset):
     def __init__(
         self,
@@ -159,3 +159,32 @@ class TSDatasetFlatTF(TSDatasetFlat):
             print(f"Error en {cache_f}, reintentando...")
             if cache_f.exists(): cache_f.unlink()
             return self.__getitem__((idx + 1) % len(self.samples))
+        
+
+
+
+def prepare_tf_dataset(py_dataset, batch_size=4, is_train=True):
+    def generator():
+        for i in range(len(py_dataset)):
+            yield py_dataset[i]
+
+    # x: (T, H, W, C), y: (H, W, 1)
+    output_signature = (
+        tf.TensorSpec(shape=(3, 256, 256, 28), dtype=tf.float32), 
+        tf.TensorSpec(shape=(256, 256, 1), dtype=tf.float32)
+    )
+
+    ds = tf.data.Dataset.from_generator(
+        generator,
+        output_signature=output_signature
+    )
+
+    if is_train:
+        ds = ds.shuffle(buffer_size=100)
+    
+    ds = ds.batch(batch_size)
+    
+    ds = ds.prefetch(tf.data.AUTOTUNE).repeat()
+    
+    return ds
+
