@@ -4,32 +4,35 @@ import json
 
 from tensorflow.keras import mixed_precision
 class TverskyBCELoss(tf.keras.losses.Loss):
-    def __init__(self, alpha=0.8, beta=0.2, smooth=1.0, pos_weight=2.0):
-        super().__init__()
-        self.alpha = alpha  
-        self.beta = beta    
+    def __init__(self, alpha=0.8, beta=0.2, smooth=1.0, pos_weight=2.0, name="tversky_bce_loss"):
+        super().__init__(name=name)
+        self.alpha = alpha
+        self.beta = beta
         self.smooth = smooth
         self.pos_weight = pos_weight
 
     def call(self, y_true, y_pred):
-        # Weighted BCE
-        bce = tf.nn.weighted_cross_entropy_with_logits(y_true, y_pred, self.pos_weight)
-        bce_loss = tf.reduce_mean(bce)
 
-        #  Tversky Loss
         y_pred_prob = tf.nn.sigmoid(y_pred)
+        
+        
+        y_true_tol = tf.nn.max_pool2d(y_true, ksize=5, strides=1, padding='SAME')
+        
+
         y_true_f = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
+        y_true_tol_f = tf.cast(tf.reshape(y_true_tol, [-1]), tf.float32)
         y_pred_f = tf.cast(tf.reshape(y_pred_prob, [-1]), tf.float32)
 
         tp = tf.reduce_sum(y_true_f * y_pred_f)
-        fn = tf.reduce_sum(y_true_f * (1 - y_pred_f))
-        fp = tf.reduce_sum((1 - y_true_f) * y_pred_f)
+        fn = tf.reduce_sum(y_true_f * (1 - y_pred_f)) # Castigo si no ve el fuego real
+        fp = tf.reduce_sum((1 - y_true_tol_f) * y_pred_f) # Castigo solo si está FUERA de la zona de 2px
 
         tversky_index = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
         tversky_loss = 1.0 - tversky_index
 
-        # 0.5 * BCE (Estabilidad píxel a píxel) 
-        # + 1.5 * Tversky (Fuerza el Recall y la forma del incendio)
+        bce = tf.nn.weighted_cross_entropy_with_logits(y_true, y_pred, self.pos_weight)
+        bce_loss = tf.reduce_mean(bce)
+
         return (0.5 * bce_loss) + (1.5 * tversky_loss)
 
 policy = mixed_precision.Policy('mixed_float16')
