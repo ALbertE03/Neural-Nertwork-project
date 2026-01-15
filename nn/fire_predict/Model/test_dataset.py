@@ -19,7 +19,6 @@ class InferenceTS(TSDatasetFlat):
         """
         resampling_mode = Resampling.nearest if is_label else Resampling.bilinear
         
-        # Leemos los datos reescalando directamente en la lectura de rasterio
         data = dataset.read(
             bands,
             out_shape=(len(bands) if bands else dataset.count, self.target_size, self.target_size),
@@ -32,18 +31,17 @@ class InferenceTS(TSDatasetFlat):
         region = self.raw_paths[info["region"]]
         t_start = info["t_start"]
 
-        # 1. Cargar y reescalar toda la secuencia a 512x512
-        full_seq_512 = [] # Lista de arrays de [C, 512, 512]
+        full_seq_512 = [] # [C, 512, 512]
         
         for t in range(t_start, t_start + self.seq_len):
-            # VIIRS Day (Canales 1-6 y canal 7 por separado)
+        
             with rasterio.open(region["VIIRS_Day"][t]) as dsrc:
                 day = self._read_and_rescale(dsrc, [1, 2, 3, 4, 5, 6])
                 fire_today = self._read_and_rescale(dsrc, [7], is_label=True)
 
             # VIIRS Night
             with rasterio.open(region["VIIRS_Night"][t]) as nsrc:
-                # Asumiendo que queremos los últimos 2 canales según tu código original
+              
                 num_bands = nsrc.count
                 night = self._read_and_rescale(nsrc, [num_bands-1, num_bands])
 
@@ -51,16 +49,13 @@ class InferenceTS(TSDatasetFlat):
             with rasterio.open(region["FirePred"][t]) as fsrc:
                 firep = self._read_and_rescale(fsrc, None)
 
-            # Combinar todos los canales para el tiempo T: [C_total, 512, 512]
             combined_t = np.concatenate([day, fire_today, night, firep], axis=0)
             full_seq_512.append(combined_t)
 
-        # Convertir a tensor: [T, C, 512, 512]
         full_seq_tensor = np.stack(full_seq_512)
 
-        # 2. Dividir en 4 parches de 256x256
+
         patches = []
-        # Cuadrantes: Top-Left, Top-Right, Bottom-Left, Bottom-Right
         offsets = [(0, 0), (0, 256), (256, 0), (256, 256)]
         
         for (y, x) in offsets:
@@ -81,10 +76,9 @@ class InferenceTS(TSDatasetFlat):
         preds = []
         
         with torch.no_grad():
-            # patches_tensor: [4, T, C, 256, 256]
             for i in range(4):
                 input_patch = patches_tensor[i].unsqueeze(0).to(device)
-                output = model(input_patch) # Salida esperada: [1, 1, 256, 256]
+                output = model(input_patch) # [1, 1, 256, 256]
                 preds.append(output.squeeze().cpu().numpy())
 
         # Unir patches

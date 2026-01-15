@@ -3,93 +3,93 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
-from sklearn.metrics import (f1_score, jaccard_score, precision_score, 
-                             recall_score, accuracy_score, precision_recall_curve, 
-                             auc, confusion_matrix, ConfusionMatrixDisplay)
+import tensorflow as tf
+import scipy.ndimage as ndimage
+from sklearn.metrics import jaccard_score, confusion_matrix, ConfusionMatrixDisplay
+
+def get_tolerant_labels(y_true, pixels=2):
+    """Dilata las etiquetas reales para permitir un margen de error."""
+    struct = ndimage.generate_binary_structure(2, 1)
+    struct = ndimage.iterate_structure(struct, pixels)
+    return ndimage.binary_dilation(y_true, structure=struct).astype(np.uint8)
 
 input_shape = (3, 256, 256, 28)
-model = build_unet3d(input_shape=input_shape)
+model = build_convlstm_bottleneck128(input_shape=input_shape)
+weights_path = "saved/checkpoints/best_fire_model7_convlstm.weights.h5"
 
-weights_path = "saved/checkpoints/best_fire_model2.weights.h5"  
 if Path(weights_path).exists():
     model.load_weights(weights_path)
-    print(f"[*] Pesos cargados correctamente desde {weights_path}")
+    print(f"[*] Pesos cargados: {weights_path}")
 else:
     print("[!] Error: No se encontraron los pesos.")
 
-ds_inference = InferenceTF(
-    path_valid=test,
-    cache_dir=cache_base/'test'
-)
 
-
+ds_inference = InferenceTF(path_valid=test, cache_dir=cache_base/'test')
 
 stats = []
-all_y_true = []
-all_y_pred = []
+g_tp_tol, g_fp_tol, g_fn_tol = 0, 0, 0
+output_vis_dir = Path("inference_results")
+output_vis_dir.mkdir(exist_ok=True)
 
-print(f"Iniciando inferencia en {len(ds_inference)} muestras...")
+print(f"Iniciando inferencia y visualización...")
+
 
 for i in tqdm(range(len(ds_inference))):
     sample = ds_inference[i]
     patches = sample["patches"]
     sample_id = sample["sample_id"]
     
-    pred_512 = ds_inference.predict_full_image(model, patches)
+    # Predicción y GT (512x512)
+    pred_probs = ds_inference.predict_full_image(model, patches)
     y_true_512 = ds_inference.get_ground_truth(i)
     
-    y_true_flat = (y_true_512 > 0.5).astype(np.uint8).flatten()
-    y_pred_probs = pred_512.flatten()
-    y_pred_bin = (y_pred_probs > 0.5).astype(np.uint8)
+    y_true_bin = (y_true_512 > 0.5).astype(np.uint8)
+    y_pred_bin = (pred_probs > 0.5).astype(np.uint8)
     
+    # Lógica de Tolerancia para métricas
+    y_true_tol = get_tolerant_labels(y_true_bin, pixels=2)
+    
+    # Cálculo de métricas locales
+    tp_t = np.sum((y_pred_bin == 1) & (y_true_tol == 1))
+    fp_t = np.sum((y_pred_bin == 1) & (y_true_tol == 0))
+    fn_t = np.sum((y_pred_bin == 0) & (y_true_bin == 1))
+    
+    p_tol = tp_t / (tp_t + fp_t + 1e-7)
+    r_tol = tp_t / (tp_t + fn_t + 1e-7)
+    f1_t = 2 * (p_tol * r_tol) / (p_tol + r_tol + 1e-7)
+    
+    # Acumular globales
+    g_tp_tol += tp_t; g_fp_tol += fp_t; g_fn_tol += fn_t
+    stats.append({"id": sample_id, "f1_tol": f1_t})
 
-    all_y_true.append(y_true_flat)
-    all_y_pred.append(y_pred_probs)
 
-    m = {
-        "id": sample_id,
-        "f1": f1_score(y_true_flat, y_pred_bin, zero_division=1),
-        "iou": jaccard_score(y_true_flat, y_pred_bin, zero_division=1),
-        "precision": precision_score(y_true_flat, y_pred_bin, zero_division=1),
-        "recall": recall_score(y_true_flat, y_pred_bin, zero_division=1),
-        "auc_pr": auc(*precision_recall_curve(y_true_flat, y_pred_probs)[1::-1])
-    }
-    stats.append(m)
+    if np.sum(y_true_bin) > 0 or np.sum(y_pred_bin) > 0:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Columna 1: Ground Truth
+        axes[0].imshow(y_true_bin, cmap='inferno')
+        axes[0].set_title(f"Target Real (GT)\nID: {sample_id}")
+        
+        # Columna 2: Predicción (Probabilidades)
+        im = axes[1].imshow(pred_probs, cmap='inferno')
+        axes[1].set_title(f"Predicción (Probabilidades)\nF1 Tol: {f1_t:.4f}")
+        plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+        
+        # Columna 3: Error Overlay (Donde falló)
+        # Verde: TP, Rojo: FP, Azul: FN
+        overlay = np.zeros((512, 512, 3))
+        overlay[..., 1] = (y_pred_bin * y_true_bin) # Verde: Acierto exacto
+        overlay[..., 0] = (y_pred_bin * (1 - y_true_tol)) # Rojo: Falso Positivo (lejos del fuego)
+        overlay[..., 2] = (y_true_bin * (1 - y_pred_bin)) # Azul: Falso Negativo (olvido)
+        
+        axes[2].imshow(overlay)
+        axes[2].set_title("Análisis de Error\nVerde:TP, Rojo:FP, Azul:FN")
+        
+        for ax in axes: ax.axis('off')
+        
+        plt.savefig(output_vis_dir / f"pred_{sample_id}.png", bbox_inches='tight')
+        plt.close() 
 
-
-all_y_true = np.concatenate(all_y_true)
-all_y_pred = np.concatenate(all_y_pred)
-all_y_pred_bin = (all_y_pred > 0.5).astype(np.uint8)
-
-print("\n" + "="*40)
-print("MÉTRICAS GLOBALES (TOTAL DATASET)")
-print("="*40)
-
-global_precision, global_recall, _ = precision_recall_curve(all_y_true, all_y_pred)
-global_auc_pr = auc(global_recall, global_precision)
-
-print(f"Global IoU (Clase 1):  {jaccard_score(all_y_true, all_y_pred_bin):.4f}")
-print(f"Global F1-Score:      {f1_score(all_y_true, all_y_pred_bin):.4f}")
-print(f"Global Precision:     {precision_score(all_y_true, all_y_pred_bin):.4f}")
-print(f"Global Recall:        {recall_score(all_y_true, all_y_pred_bin):.4f}")
-print(f"Global AUC-PR:        {global_auc_pr:.4f}")
-
-fig, ax = plt.subplots(1, 2, figsize=(16, 6))
-
-cm = confusion_matrix(all_y_true, all_y_pred_bin)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['No Fuego', 'Fuego'])
-disp.plot(ax=ax[0], cmap='Blues', values_format='d')
-ax[0].set_title("Matriz de Confusión Global (Píxeles)")
-
-ax[1].plot(global_recall, global_precision, color='red', lw=2, label=f'AUC-PR: {global_auc_pr:.4f}')
-ax[1].fill_between(global_recall, global_precision, alpha=0.2, color='red')
-ax[1].set_title("Curva Precision-Recall Global")
-ax[1].set_xlabel("Recall")
-ax[1].set_ylabel("Precision")
-ax[1].legend()
-
-plt.tight_layout()
-plt.show()
-
-df_stats = pd.DataFrame(stats)
-df_stats.to_csv("test_metrics_report_detailed.csv", index=False)
+final_f1 = 2 * ( (g_tp_tol/(g_tp_tol+g_fp_tol)) * (g_tp_tol/(g_tp_tol+g_fn_tol)) ) / ( (g_tp_tol/(g_tp_tol+g_fp_tol)) + (g_tp_tol/(g_tp_tol+g_fn_tol)) )
+print(f"\n[!] Inferencia terminada. F1 Tolerante Global: {final_f1:.4f}")
+pd.DataFrame(stats).to_csv("test_metrics_detailed.csv", index=False)

@@ -1,85 +1,121 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
-class AttentionBlock3D(layers.Layer):
-    """Attention Gate para 3D UNet en TensorFlow."""
-    def __init__(self, F_int, **kwargs):
+# Si usas el bloque de atención con TimeDistributed y Conv2D, 
+# asegúrate de tener estas referencias claras:
+import tensorflow.keras.backend as K
+class ConvLSTMAttentionBlock(tf.keras.layers.Layer):
+    def __init__(self, channels, reduction=4, **kwargs):
         super().__init__(**kwargs)
-        self.W_g = models.Sequential([
-            layers.Conv3D(F_int, kernel_size=1, strides=1, padding='same', use_bias=True),
-            layers.BatchNormalization()
-        ])
-        self.W_x = models.Sequential([
-            layers.Conv3D(F_int, kernel_size=1, strides=1, padding='same', use_bias=True),
-            layers.BatchNormalization()
-        ])
-        self.psi = models.Sequential([
-            layers.Conv3D(1, kernel_size=1, strides=1, padding='same', use_bias=True),
-            layers.BatchNormalization(),
-            layers.Activation('sigmoid')
-        ])
+        self.channels = channels
+        self.reduction = reduction
 
-    def call(self, g, x):
-        g1 = self.W_g(g)
-        x1 = self.W_x(x)
-        psi = layers.Activation('relu')(g1 + x1)
-        psi = self.psi(psi)
-        return x * psi
+        # Channel attention
+        self.avg_pool = tf.keras.layers.TimeDistributed(
+            tf.keras.layers.GlobalAveragePooling2D()
+        )
+        self.fc1 = tf.keras.layers.Dense(channels // reduction, activation='relu')
+        self.fc2 = tf.keras.layers.Dense(channels, activation='sigmoid')
 
-def conv_block(x, out_c, dropout_rate):
-    """Bloque de doble convolución 3D."""
-    x = layers.Conv3D(out_c, kernel_size=3, padding='same')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation('relu')(x)
-    x = layers.Dropout(dropout_rate)(x)
-    
-    x = layers.Conv3D(out_c, kernel_size=3, padding='same')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation('relu')(x)
-    x = layers.Dropout(dropout_rate)(x)
-    return x
+        # Spatial attention
+        self.spatial_conv = tf.keras.layers.TimeDistributed(
+            tf.keras.layers.Conv2D(
+                filters=1,
+                kernel_size=7,
+                padding='same',
+                activation='sigmoid'
+            )
+        )
 
-def build_unet3d(input_shape=(3, 256, 256, 28), out_channels=1, dropout=0.3):
-    # Dimensiones: (Tiempo, Alto, Ancho, Canales)
+    def call(self, x):
+        # x: (B, T, H, W, C)
+
+        # -------- Channel Attention --------
+        c = self.avg_pool(x)              # (B, T, C)
+        c = self.fc1(c)                   # (B, T, C//r)
+        c = self.fc2(c)                   # (B, T, C)
+        c = tf.expand_dims(c, axis=2)     # (B, T, 1, C)
+        c = tf.expand_dims(c, axis=2)     # (B, T, 1, 1, C)
+
+        x = x * c
+
+        # -------- Spatial Attention --------
+        avg_s = tf.reduce_mean(x, axis=-1, keepdims=True)
+        max_s = tf.reduce_max(x, axis=-1, keepdims=True)
+        s = tf.concat([avg_s, max_s], axis=-1)
+
+        s = self.spatial_conv(s)          # (B, T, H, W, 1)
+
+        return x * s
+
+
+        return x * s
+def build_convlstm_bottleneck128(
+    input_shape=(3, 256, 256, 28),
+    dropout=0.3
+):
     inputs = layers.Input(shape=input_shape)
 
-    # Encoder
-    # Nivel 1
-    e1 = conv_block(inputs, 32, dropout)
-    # MaxPool3D: Solo reducimos H y W (1, 2, 2) igual que en tu PyTorch
-    p1 = layers.MaxPooling3D(pool_size=(1, 2, 2))(e1)
-    
-    # Nivel 2
-    e2 = conv_block(p1, 64, dropout)
-    p2 = layers.MaxPooling3D(pool_size=(1, 2, 2))(e2)
+    # ---------- ENCODER ----------
+    e1 = layers.ConvLSTM2D(
+        24, 3, padding='same',
+        return_sequences=True,
+        dropout=dropout,
+        recurrent_dropout=0.1
+    )(inputs)
+    e1 = layers.LayerNormalization()(e1)
 
-    # Bottleneck
-    b = conv_block(p2, 256, dropout)
+    p1 = layers.TimeDistributed(layers.MaxPooling2D(2))(e1)
 
-    # Decoder
-    # Up 2
-    u2 = layers.UpSampling3D(size=(1, 2, 2))(b)
-    # Atención 2: g es la señal del decoder, x es la skip connection
-    att2 = AttentionBlock3D(F_int=64)(g=u2, x=e2)
-    d2 = layers.Concatenate()([u2, att2])
-    d2 = conv_block(d2, 64, dropout)
+    e2 = layers.ConvLSTM2D(
+        48, 3, padding='same',
+        return_sequences=True,
+        dropout=dropout
+    )(p1)
+    e2 = layers.LayerNormalization()(e2)
 
-    # Up 1
-    u1 = layers.UpSampling3D(size=(1, 2, 2))(d2)
-    # Atención 1
-    att1 = AttentionBlock3D(F_int=32)(g=u1, x=e1)
-    d1 = layers.Concatenate()([u1, att1])
-    d1 = conv_block(d1, 32, dropout)
+    p2 = layers.TimeDistributed(layers.MaxPooling2D(2))(e2)
 
-    # Salida Final
-    out = layers.Conv3D(out_channels, kernel_size=1)(d1)
-    
-    # Temporal Compressor: Reduce la dimensión T de 3 a 1
-    # Usamos padding='valid' para que el kernel de 3 reduzca (3, H, W) -> (1, H, W)
-    out = layers.Conv3D(out_channels, kernel_size=(3, 1, 1), padding='valid')(out)
-    
-    # Squeeze: En TF usamos Reshape o Lambda para quitar la dimensión temporal
-    # De (Batch, 1, 256, 256, 1) -> (Batch, 256, 256, 1)
-    out = layers.Reshape((input_shape[1], input_shape[2], out_channels))(out)
+    e3 = layers.ConvLSTM2D(
+        96, 3, padding='same',
+        return_sequences=True,
+        dropout=dropout
+    )(p2)
+    e3 = layers.LayerNormalization()(e3)
 
-    return models.Model(inputs, out, name="UNet3D_Attention")
+    # ---------- BOTTLENECK ----------
+    p3 = layers.TimeDistributed(layers.MaxPooling2D(2))(e3)
+
+    b = layers.ConvLSTM2D(
+        128, 3, padding='same',
+        return_sequences=True,
+        dropout=dropout
+    )(p3)
+    b = layers.LayerNormalization()(b)
+    b = ConvLSTMAttentionBlock(128)(b)
+
+    # ---------- DECODER ----------
+    u3 = layers.TimeDistributed(layers.UpSampling2D(2))(b)
+    u3 = layers.Concatenate(axis=-1)([u3, e3])
+    u3 = layers.ConvLSTM2D(96, 3, padding='same', return_sequences=True)(u3)
+
+    u2 = layers.TimeDistributed(layers.UpSampling2D(2))(u3)
+    u2 = layers.Concatenate(axis=-1)([u2, e2])
+    u2 = layers.ConvLSTM2D(48, 3, padding='same', return_sequences=True)(u2)
+    u2 = ConvLSTMAttentionBlock(48)(u2)
+
+    u1 = layers.TimeDistributed(layers.UpSampling2D(2))(u2)
+    u1 = layers.Concatenate(axis=-1)([u1, e1])
+    u1 = layers.ConvLSTM2D(24, 3, padding='same', return_sequences=True)(u1)
+    u1 = ConvLSTMAttentionBlock(24)(u1)
+
+    # ---------- OUTPUT ----------
+    x = layers.ConvLSTM2D(
+        16, 3, padding='same',
+        return_sequences=False
+    )(u1)
+
+    out = layers.Conv2D(1, 1, padding='same')(x)
+    out = layers.Activation('linear', dtype='float32', name='predictions')(out)
+
+    return models.Model(inputs, out, name="ConvLSTM_UNet_Att128")
