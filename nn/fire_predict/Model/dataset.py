@@ -28,16 +28,16 @@ class TSDatasetFlat(Dataset):
         self.raw_paths = self._find_tiff_files(path_valid)
 
         if self.catalog_path.exists() and not force_rebuild:
-            print(f"Cargando catálogo plano desde {self.catalog_path}...")
+            print(f"Cargando catálogo desde {self.catalog_path}...")
             with open(self.catalog_path, "r") as f:
                 self.samples = json.load(f)
         else:
-            print("Generando catálogo plano (cada ventana es una muestra independiente)...")
+            print("Generando catálogo")
             self.samples = self._create_flat_catalog()
             with open(self.catalog_path, "w") as f:
                 json.dump(self.samples, f)
 
-        print(f"Dataset listo: {len(self.samples)} muestras independientes.")
+        print(f"Dataset listo: {len(self.samples)} muestras")
 
     def _find_tiff_files(self, paths):
         r = {}

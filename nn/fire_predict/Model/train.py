@@ -22,21 +22,18 @@ class FocalDiceLoss(tf.keras.losses.Loss):
         y_true = tf.cast(y_true, tf.float32)
         y_pred = tf.cast(y_pred, tf.float32)
 
-        # Tolerancia espacial
         y_true_tol = tf.nn.max_pool2d(y_true, ksize=5, strides=1, padding='SAME')
 
         y_pred_prob = tf.nn.sigmoid(y_pred)
         eps = tf.keras.backend.epsilon()
         y_pred_prob = tf.clip_by_value(y_pred_prob, eps, 1.0 - eps)
 
-        # ---------- FOCAL LOSS (TOLERANTE) ----------
         focal_pos = -self.alpha * tf.pow(1 - y_pred_prob, self.gamma) * tf.math.log(y_pred_prob)
         focal_neg = -(1 - self.alpha) * tf.pow(y_pred_prob, self.gamma) * tf.math.log(1 - y_pred_prob)
 
         focal = y_true * focal_pos + (1 - y_true_tol) * focal_neg
         focal_loss = tf.reduce_mean(focal)
 
-        # ---------- DICE TOLERANTE ----------
         y_true_f = tf.reshape(y_true, [-1])
         y_true_tol_f = tf.reshape(y_true_tol, [-1])
         y_pred_f = tf.reshape(y_pred_prob, [-1])
@@ -83,7 +80,7 @@ class TolerantRecall(tf.keras.metrics.Metric):
         y_pred_bin = tf.cast(y_pred > self.threshold, tf.float32)
 
         tp = tf.reduce_sum(y_pred_bin * y_true)
-        # FN es fuego real que no tocamos ni de cerca (usamos y_pred_tol aquí)
+
         y_pred_tol = tf.nn.max_pool2d(y_pred_bin, ksize=self.tol_ksize, strides=1, padding='SAME')
         fn = tf.reduce_sum(y_true * (1.0 - y_pred_tol))
 
@@ -110,10 +107,9 @@ class TolerantFalseNegatives(tf.keras.metrics.Metric):
         y_true = tf.cast(y_true, tf.float32)
         y_pred = tf.cast(y_pred, tf.float32)
 
-        # Binarizar predicción
+
         y_pred_bin = tf.cast(tf.nn.sigmoid(y_pred) > self.threshold, tf.float32)
 
-        # Tolerancia aplicada a la predicción
         y_pred_tol = tf.nn.max_pool2d(
             y_pred_bin,
             ksize=self.tol_ksize,
@@ -121,7 +117,6 @@ class TolerantFalseNegatives(tf.keras.metrics.Metric):
             padding='SAME'
         )
 
-        # FN tolerante: GT positivo sin predicción cercana
         fn = tf.reduce_sum(y_true * (1.0 - y_pred_tol))
         pos = tf.reduce_sum(y_true)
 
@@ -144,14 +139,14 @@ class VisualVerifyCallback(tf.keras.callbacks.Callback):
         os.makedirs(save_dir, exist_ok=True)
 
     def on_epoch_end(self, epoch, logs=None):
-        # Tomar un batch de validación
+     
         for inputs, targets in self.dataset.take(1):
             preds = self.model.predict(inputs, verbose=0)
             preds = tf.nn.sigmoid(preds).numpy()
             
             fig, axes = plt.subplots(1, 3, figsize=(15, 5))
             
-            # Frame de entrada (Canal 0 del último paso temporal)
+
             axes[0].imshow(inputs[0, -1, :, :, 0], cmap='viridis')
             axes[0].set_title("Input (Last Frame)")
             
@@ -173,7 +168,7 @@ class TolerantF1Score(tf.keras.metrics.Metric):
         super().__init__(name=name, **kwargs)
         self.tol_ksize = tol_ksize
         self.threshold = threshold
-        # Usamos pesos internos para calcular Precision y Recall tolerantes
+
         self.tp = self.add_weight(name="tp", initializer="zeros")
         self.fp = self.add_weight(name="fp", initializer="zeros")
         self.fn = self.add_weight(name="fn", initializer="zeros")
@@ -181,18 +176,15 @@ class TolerantF1Score(tf.keras.metrics.Metric):
     def update_state(self, y_true, y_pred, sample_weight=None):
         y_pred_bin = tf.cast(tf.nn.sigmoid(y_pred) > self.threshold, tf.float32)
         
-        # Máscara de tolerancia para los errores (FP)
         y_true_tol = tf.nn.max_pool2d(y_true, ksize=self.tol_ksize, strides=1, padding='SAME')
-        # Máscara de tolerancia para los olvidos (FN)
+  
         y_pred_tol = tf.nn.max_pool2d(y_pred_bin, ksize=self.tol_ksize, strides=1, padding='SAME')
 
-        # 1. TP: Predicción sobre el fuego REAL (Estricto para no inflar el F1)
         tp = tf.reduce_sum(y_pred_bin * y_true)
         
-        # 2. FP: Predicción fuera de la zona de tolerancia (Liberal)
+
         fp = tf.reduce_sum(y_pred_bin * (1.0 - y_true_tol))
         
-        # 3. FN: Fuego real que no tiene ninguna predicción cerca (Liberal)
         fn = tf.reduce_sum(y_true * (1.0 - y_pred_tol))
 
         self.tp.assign_add(tp)
@@ -221,11 +213,11 @@ def main():
     best_checkpoint_path = 'saved/checkpoints/best_fire_model7_convlstm.weights.h5'
     history_path = 'training_history7.json'
     
-    # 1. Definición de Métricas (Añadimos F1 y IoU para el historial)
+
     metrics = [
         TolerantRecall(name="tol_recall"),
         TolerantFalseNegatives(name="tol_fn"),
-        TolerantF1Score(name="f1_score"), # Métrica balanceada para el monitor
+        TolerantF1Score(name="f1_score"), 
         tf.keras.metrics.BinaryIoU(target_class_ids=[1], name="iou"), # IoU para clase fuego
         tf.keras.metrics.Precision(name="precision")
     ]
@@ -244,7 +236,7 @@ def main():
                 history_cb.history_dict = saved_history
                 if saved_history:
                     initial_epoch = saved_history[-1]['epoch']
-                    # Buscamos val_f1_score que es más estable
+        
                     f1_values = [h.get('val_f1_score', -1.0) for h in saved_history]
                     best_val_f1 = max(f1_values)
                     print(f"[*] Historial cargado. Reanudando en época {initial_epoch + 1}")
@@ -283,7 +275,7 @@ def main():
             filepath=last_checkpoint_path,
             save_best_only=False,
             save_weights_only=True,
-            verbose=0 # No saturar la consola
+            verbose=0 
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss',
@@ -296,7 +288,7 @@ def main():
         visual_cb
     ]
 
-    print(f"\nIniciando entrenamiento: Pure ConvLSTM + Aggressive Loss")
+    print(f"\nIniciando entrenamiento ConvLSTM")
 
     steps_per_epoch = len(train_dataset) // batch_size
     validation_steps = len(val_dataset) // batch_size
