@@ -1,9 +1,7 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models
-
-# Si usas el bloque de atención con TimeDistributed y Conv2D, 
-# asegúrate de tener estas referencias claras:
 import tensorflow.keras.backend as K
+
 class ConvLSTMAttentionBlock(tf.keras.layers.Layer):
     def __init__(self, channels, reduction=4, **kwargs):
         super().__init__(**kwargs)
@@ -30,7 +28,7 @@ class ConvLSTMAttentionBlock(tf.keras.layers.Layer):
     def call(self, x):
         # x: (B, T, H, W, C)
 
-        # -------- Channel Attention --------
+        #  Channel Attention 
         c = self.avg_pool(x)              # (B, T, C)
         c = self.fc1(c)                   # (B, T, C//r)
         c = self.fc2(c)                   # (B, T, C)
@@ -39,7 +37,7 @@ class ConvLSTMAttentionBlock(tf.keras.layers.Layer):
 
         x = x * c
 
-        # -------- Spatial Attention --------
+        #  Spatial Attention 
         avg_s = tf.reduce_mean(x, axis=-1, keepdims=True)
         max_s = tf.reduce_max(x, axis=-1, keepdims=True)
         s = tf.concat([avg_s, max_s], axis=-1)
@@ -56,12 +54,12 @@ def build_convlstm_bottleneck128(
 ):
     inputs = layers.Input(shape=input_shape)
 
-    # ---------- ENCODER ----------
+    #  ENCODER 
     e1 = layers.ConvLSTM2D(
         24, 3, padding='same',
         return_sequences=True,
         dropout=dropout,
-        recurrent_dropout=0.1
+        recurrent_dropout=0.2
     )(inputs)
     e1 = layers.LayerNormalization()(e1)
 
@@ -70,7 +68,8 @@ def build_convlstm_bottleneck128(
     e2 = layers.ConvLSTM2D(
         48, 3, padding='same',
         return_sequences=True,
-        dropout=dropout
+        dropout=dropout,
+        recurrent_dropout=0.2
     )(p1)
     e2 = layers.LayerNormalization()(e2)
 
@@ -79,11 +78,12 @@ def build_convlstm_bottleneck128(
     e3 = layers.ConvLSTM2D(
         96, 3, padding='same',
         return_sequences=True,
-        dropout=dropout
+        dropout=dropout,
+        recurrent_dropout=0.2
     )(p2)
     e3 = layers.LayerNormalization()(e3)
 
-    # ---------- BOTTLENECK ----------
+    #  BOTTLENECK 
     p3 = layers.TimeDistributed(layers.MaxPooling2D(2))(e3)
 
     b = layers.ConvLSTM2D(
@@ -94,7 +94,7 @@ def build_convlstm_bottleneck128(
     b = layers.LayerNormalization()(b)
     b = ConvLSTMAttentionBlock(128)(b)
 
-    # ---------- DECODER ----------
+    #  DECODER 
     u3 = layers.TimeDistributed(layers.UpSampling2D(2))(b)
     u3 = layers.Concatenate(axis=-1)([u3, e3])
     u3 = layers.ConvLSTM2D(96, 3, padding='same', return_sequences=True)(u3)
@@ -109,7 +109,7 @@ def build_convlstm_bottleneck128(
     u1 = layers.ConvLSTM2D(24, 3, padding='same', return_sequences=True)(u1)
     u1 = ConvLSTMAttentionBlock(24)(u1)
 
-    # ---------- OUTPUT ----------
+    #  OUTPUT 
     x = layers.ConvLSTM2D(
         16, 3, padding='same',
         return_sequences=False
