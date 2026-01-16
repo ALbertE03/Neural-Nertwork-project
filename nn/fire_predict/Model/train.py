@@ -34,10 +34,6 @@ class FocalDiceLoss(tf.keras.losses.Loss):
         focal = y_true * focal_pos + (1 - y_true_tol) * focal_neg
         focal_loss = tf.reduce_mean(focal)
 
-        y_true_f = tf.reshape(y_true, [-1])
-        y_true_tol_f = tf.reshape(y_true_tol, [-1])
-        y_pred_f = tf.reshape(y_pred_prob, [-1])
-
         tp = tf.reduce_sum(y_true_f * y_pred_tol_f)        
         fn = tf.reduce_sum(y_true_f * (1 - y_pred_tol_f))    
         fp = tf.reduce_sum((1 - y_true_tol_f) * y_pred_f) 

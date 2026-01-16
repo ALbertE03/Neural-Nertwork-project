@@ -101,7 +101,7 @@ class InferenceTF(InferenceTS):
         
         preds = []
         for i in range(4):
-            patch = patches_tf[i:i+1] # Shape: (1, 3, 256, 256, 10)
+            patch = patches_tf[i:i+1] # Shape: (1, 3, 256, 256, 28)
             
             
             # Predicción: salida (1, 256, 256, 1)
@@ -120,6 +120,6 @@ class InferenceTF(InferenceTS):
         t_target = info["t_start"] + self.seq_len
         
         with rasterio.open(region["VIIRS_Day"][t_target]) as dsrc:
-            # Reescalamos a 512 usando vecino más cercano (es una máscara)
+           
             y_true = dsrc.read(7, out_shape=(512, 512), resampling=rasterio.enums.Resampling.nearest)
             return self._normalize(y_true, is_label=True)
