@@ -38,9 +38,9 @@ class FocalDiceLoss(tf.keras.losses.Loss):
         y_true_tol_f = tf.reshape(y_true_tol, [-1])
         y_pred_f = tf.reshape(y_pred_prob, [-1])
 
-        tp = tf.reduce_sum(y_true_f * y_pred_f)
-        fn = tf.reduce_sum(y_true_f * (1 - y_pred_f))
-        fp = tf.reduce_sum((1 - y_true_tol_f) * y_pred_f)
+        tp = tf.reduce_sum(y_true_f * y_pred_tol_f)        
+        fn = tf.reduce_sum(y_true_f * (1 - y_pred_tol_f))    
+        fp = tf.reduce_sum((1 - y_true_tol_f) * y_pred_f) 
 
         dice = (2 * tp + self.smooth) / (2 * tp + fn + fp + self.smooth)
         dice_loss = 1 - dice
