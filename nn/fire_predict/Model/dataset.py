@@ -1,13 +1,6 @@
-import os
-import json
-import torch
-import numpy as np
-import rasterio
-from torch.utils.data import Dataset
-from pathlib import Path
-from tqdm import tqdm
-import tensorflow as tf
-class TSDatasetFlat(Dataset):
+
+
+class TSDataset(Dataset):
     def __init__(
         self,
         path_valid,
@@ -28,16 +21,16 @@ class TSDatasetFlat(Dataset):
         self.raw_paths = self._find_tiff_files(path_valid)
 
         if self.catalog_path.exists() and not force_rebuild:
-            print(f"Cargando catálogo desde {self.catalog_path}...")
+            print(f"Cargando catálogo plano desde {self.catalog_path}...")
             with open(self.catalog_path, "r") as f:
                 self.samples = json.load(f)
         else:
-            print("Generando catálogo")
+            print("Generando catálogo ...")
             self.samples = self._create_flat_catalog()
             with open(self.catalog_path, "w") as f:
                 json.dump(self.samples, f)
 
-        print(f"Dataset listo: {len(self.samples)} muestras")
+        print(f"Dataset listo: {len(self.samples)} muestras independientes.")
 
     def _find_tiff_files(self, paths):
         r = {}
@@ -83,7 +76,7 @@ class TSDatasetFlat(Dataset):
         t_start = info["t_start"]
         
         seq_x = []
-        # Solo cargamos la ventana de seq_len días
+
         for t in range(t_start, t_start + self.seq_len):
             #  VIIRS Day
             with rasterio.open(region["VIIRS_Day"][t]) as dsrc:
@@ -104,7 +97,7 @@ class TSDatasetFlat(Dataset):
             x_combined = np.concatenate([day, fire_today, night, firep], axis=0)
             seq_x.append(x_combined)
 
-        # Target: El canal 7 del día siguiente (t_start + seq_len)
+        # Target
         with rasterio.open(region["VIIRS_Day"][t_start + self.seq_len]) as dsrc:
             y_target = self._normalize(dsrc.read([7], window=win), is_label=True)
 
@@ -117,28 +110,6 @@ class TSDatasetFlat(Dataset):
         info = self.samples[idx]
         cache_f = self.cache_dir / f"{info['sample_id']}.npz"
 
-        if not cache_f.exists():
-            x, y = self._load_single_window(info)
-            np.savez_compressed(cache_f, x=x, y=y)
-        else:
-            try:
-                data = np.load(cache_f)
-                x, y = data["x"], data["y"]
-            except Exception as e:
-                print(f"Archivo corrupto detectado: {cache_f}")  
-                return {}
-        return {
-            "x": torch.from_numpy(x).float(), # [T, C, H, W]
-            "y": torch.from_numpy(y).float(), # [1, H, W] (Día siguiente)
-            "id": info['sample_id']
-        }
-
-
-class TSDatasetFlatTF(TSDatasetFlat): 
-    def __getitem__(self, idx):
-        info = self.samples[idx]
-        cache_f = self.cache_dir / f"{info['sample_id']}.npz"
-
         try:
             if not cache_f.exists():
                 x, y = self._load_single_window(info)
@@ -147,44 +118,16 @@ class TSDatasetFlatTF(TSDatasetFlat):
                 data = np.load(cache_f)
                 x, y = data["x"], data["y"]
             
-            # PyTorch: [T, C, H, W] -> TF: [T, H, W, C]
+            #  [T, C, H, W] -> [T, H, W, C]
             x = np.transpose(x, (0, 2, 3, 1)) 
-            # PyTorch: [1, H, W] -> TF: [H, W, 1]
+            # [1, H, W] -> [H, W, 1]
             y = np.transpose(y, (1, 2, 0))
             
             return x.astype(np.float32), y.astype(np.float32)
 
         except Exception as e:
-            # Si un archivo está corrupto, lo borramos y cargamos el siguiente
-            print(f"Error en {cache_f}, reintentando...")
-            if cache_f.exists(): cache_f.unlink()
-            return self.__getitem__((idx + 1) % len(self.samples))
-        
+            print(f"Error en {cache_f}")
+            raise 
 
 
-
-def prepare_tf_dataset(py_dataset, batch_size=4, is_train=True):
-    def generator():
-        for i in range(len(py_dataset)):
-            yield py_dataset[i]
-
-    # x: (T, H, W, C), y: (H, W, 1)
-    output_signature = (
-        tf.TensorSpec(shape=(3, 256, 256, 28), dtype=tf.float32), 
-        tf.TensorSpec(shape=(256, 256, 1), dtype=tf.float32)
-    )
-
-    ds = tf.data.Dataset.from_generator(
-        generator,
-        output_signature=output_signature
-    )
-
-    if is_train:
-        ds = ds.shuffle(buffer_size=100)
-    
-    ds = ds.batch(batch_size)
-    
-    ds = ds.prefetch(tf.data.AUTOTUNE).repeat()
-    
-    return ds
-
+            

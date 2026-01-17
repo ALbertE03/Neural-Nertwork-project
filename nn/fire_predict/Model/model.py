@@ -1,6 +1,3 @@
-import tensorflow as tf
-from tensorflow.keras import layers, models
-import tensorflow.keras.backend as K
 
 class ConvLSTMAttentionBlock(tf.keras.layers.Layer):
     def __init__(self, channels, reduction=4, **kwargs):
@@ -46,11 +43,10 @@ class ConvLSTMAttentionBlock(tf.keras.layers.Layer):
 
         return x * s
 
-
-        return x * s
 def build_convlstm_bottleneck128(
     input_shape=(3, 256, 256, 28),
-    dropout=0.3
+    dropout=0.3,
+    reduction=4
 ):
     inputs = layers.Input(shape=input_shape)
 
@@ -59,7 +55,6 @@ def build_convlstm_bottleneck128(
         24, 3, padding='same',
         return_sequences=True,
         dropout=dropout,
-        recurrent_dropout=0.2
     )(inputs)
     e1 = layers.LayerNormalization()(e1)
 
@@ -68,8 +63,7 @@ def build_convlstm_bottleneck128(
     e2 = layers.ConvLSTM2D(
         48, 3, padding='same',
         return_sequences=True,
-        dropout=dropout,
-        recurrent_dropout=0.2
+        dropout=dropout
     )(p1)
     e2 = layers.LayerNormalization()(e2)
 
@@ -78,8 +72,7 @@ def build_convlstm_bottleneck128(
     e3 = layers.ConvLSTM2D(
         96, 3, padding='same',
         return_sequences=True,
-        dropout=dropout,
-        recurrent_dropout=0.2
+        dropout=dropout
     )(p2)
     e3 = layers.LayerNormalization()(e3)
 
@@ -92,7 +85,7 @@ def build_convlstm_bottleneck128(
         dropout=dropout
     )(p3)
     b = layers.LayerNormalization()(b)
-    b = ConvLSTMAttentionBlock(128)(b)
+    b = ConvLSTMAttentionBlock(128,reduction=reduction)(b)
 
     #  DECODER 
     u3 = layers.TimeDistributed(layers.UpSampling2D(2))(b)
@@ -102,14 +95,14 @@ def build_convlstm_bottleneck128(
     u2 = layers.TimeDistributed(layers.UpSampling2D(2))(u3)
     u2 = layers.Concatenate(axis=-1)([u2, e2])
     u2 = layers.ConvLSTM2D(48, 3, padding='same', return_sequences=True)(u2)
-    u2 = ConvLSTMAttentionBlock(48)(u2)
+    u2 = ConvLSTMAttentionBlock(48,reduction=reduction)(u2)
 
     u1 = layers.TimeDistributed(layers.UpSampling2D(2))(u2)
     u1 = layers.Concatenate(axis=-1)([u1, e1])
     u1 = layers.ConvLSTM2D(24, 3, padding='same', return_sequences=True)(u1)
-    u1 = ConvLSTMAttentionBlock(24)(u1)
+    u1 = ConvLSTMAttentionBlock(24,reduction=reduction)(u1)
 
-    #  OUTPUT 
+    # OUTPUT 
     x = layers.ConvLSTM2D(
         16, 3, padding='same',
         return_sequences=False
