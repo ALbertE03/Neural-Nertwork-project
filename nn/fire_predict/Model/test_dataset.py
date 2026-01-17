@@ -2,6 +2,7 @@ from dataset import TSDataset
 import tensorflow as tf
 import numpy as np
 import rasterio
+from rasterio.enums import Resampling
 
 class InferenceTS(TSDataset):
     def __init__(self, *args, **kwargs):
