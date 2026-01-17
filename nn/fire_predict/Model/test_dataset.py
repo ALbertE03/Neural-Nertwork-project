@@ -1,9 +1,7 @@
-import torch
+from dataset import TSDataset
+import tensorflow as tf
 import numpy as np
 import rasterio
-import tensorflow as tf
-from rasterio.enums import Resampling
-from dataset import TSDataset
 
 class InferenceTS(TSDataset):
     def __init__(self, *args, **kwargs):
@@ -60,44 +58,18 @@ class InferenceTS(TSDataset):
         
         for (y, x) in offsets:
             patch = full_seq_tensor[:, :, y:y+256, x:x+256]
-            patches.append(torch.from_numpy(patch).float())
+            patches.append(patch)
 
         return {
-            "patches": torch.stack(patches), # [4, T, C, 256, 256]
+            "patches": np.stack(patches), # [4, T, C, 256, 256]
             "sample_id": info['sample_id']
         }
 
-    def reconstruct_image(self, model, patches_tensor, device="cuda"):
-        """
-        Toma el tensor de 4 parches, corre el modelo y une los resultados.
-        """
-        model.eval()
-        model.to(device)
-        preds = []
-        
-        with torch.no_grad():
-            # patches_tensor: [4, T, C, 256, 256]
-            for i in range(4):
-                input_patch = patches_tensor[i].unsqueeze(0).to(device)
-                output = model(input_patch) # Salida [1, 1, 256, 256]
-                preds.append(output.squeeze().cpu().numpy())
-
-        # Unir patches
-        top = np.concatenate([preds[0], preds[1]], axis=1)
-        bottom = np.concatenate([preds[2], preds[3]], axis=1)
-        full_reconstruction = np.concatenate([top, bottom], axis=0)
-        
-        return full_reconstruction # [512, 512]
-
-
-
-
-class InferenceTF(InferenceTS):
     def predict_full_image(self, model, patches_tensor):
         """
         Predice los 4 parches y los une. 
         """
-        patches_np = patches_tensor.numpy()
+        patches_np = patches_tensor
         patches_tf = np.transpose(patches_np, (0, 1, 3, 4, 2))
         
         preds = []

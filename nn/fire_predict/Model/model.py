@@ -1,20 +1,26 @@
+import tensorflow as tf 
+from tensorflow.keras.layers import TimeDistributed,GlobalAveragePooling2D,\
+                                    Dense,Conv2D,Input,ConvLSTM2D,LayerNormalization,\
+                                    MaxPooling2D,Concatenate,UpSampling2D,Activation,Layer
 
-class ConvLSTMAttentionBlock(tf.keras.layers.Layer):
+from tensorflow.keras.models import Model
+
+class ConvLSTMAttentionBlock(Layer):
     def __init__(self, channels, reduction=4, **kwargs):
         super().__init__(**kwargs)
         self.channels = channels
         self.reduction = reduction
 
         # Channel attention
-        self.avg_pool = tf.keras.layers.TimeDistributed(
-            tf.keras.layers.GlobalAveragePooling2D()
+        self.avg_pool = TimeDistributed(
+            GlobalAveragePooling2D()
         )
-        self.fc1 = tf.keras.layers.Dense(channels // reduction, activation='relu')
-        self.fc2 = tf.keras.layers.Dense(channels, activation='sigmoid')
+        self.fc1 = Dense(channels // reduction, activation='relu')
+        self.fc2 = Dense(channels, activation='sigmoid')
 
         # Spatial attention
-        self.spatial_conv = tf.keras.layers.TimeDistributed(
-            tf.keras.layers.Conv2D(
+        self.spatial_conv = TimeDistributed(
+            Conv2D(
                 filters=1,
                 kernel_size=7,
                 padding='same',
@@ -48,67 +54,67 @@ def build_convlstm_bottleneck128(
     dropout=0.3,
     reduction=4
 ):
-    inputs = layers.Input(shape=input_shape)
+    inputs = Input(shape=input_shape)
 
     #  ENCODER 
-    e1 = layers.ConvLSTM2D(
+    e1 = ConvLSTM2D(
         24, 3, padding='same',
         return_sequences=True,
         dropout=dropout,
     )(inputs)
-    e1 = layers.LayerNormalization()(e1)
+    e1 = LayerNormalization()(e1)
 
-    p1 = layers.TimeDistributed(layers.MaxPooling2D(2))(e1)
+    p1 = TimeDistributed(MaxPooling2D(2))(e1)
 
-    e2 = layers.ConvLSTM2D(
+    e2 = ConvLSTM2D(
         48, 3, padding='same',
         return_sequences=True,
         dropout=dropout
     )(p1)
-    e2 = layers.LayerNormalization()(e2)
+    e2 = LayerNormalization()(e2)
 
-    p2 = layers.TimeDistributed(layers.MaxPooling2D(2))(e2)
+    p2 = TimeDistributed(MaxPooling2D(2))(e2)
 
-    e3 = layers.ConvLSTM2D(
+    e3 = ConvLSTM2D(
         96, 3, padding='same',
         return_sequences=True,
         dropout=dropout
     )(p2)
-    e3 = layers.LayerNormalization()(e3)
+    e3 = LayerNormalization()(e3)
 
     #  BOTTLENECK 
-    p3 = layers.TimeDistributed(layers.MaxPooling2D(2))(e3)
+    p3 = TimeDistributed(MaxPooling2D(2))(e3)
 
-    b = layers.ConvLSTM2D(
+    b = ConvLSTM2D(
         128, 3, padding='same',
         return_sequences=True,
         dropout=dropout
     )(p3)
-    b = layers.LayerNormalization()(b)
+    b = LayerNormalization()(b)
     b = ConvLSTMAttentionBlock(128,reduction=reduction)(b)
 
     #  DECODER 
-    u3 = layers.TimeDistributed(layers.UpSampling2D(2))(b)
-    u3 = layers.Concatenate(axis=-1)([u3, e3])
-    u3 = layers.ConvLSTM2D(96, 3, padding='same', return_sequences=True)(u3)
+    u3 = TimeDistributed(UpSampling2D(2))(b)
+    u3 = Concatenate(axis=-1)([u3, e3])
+    u3 = ConvLSTM2D(96, 3, padding='same', return_sequences=True)(u3)
 
-    u2 = layers.TimeDistributed(layers.UpSampling2D(2))(u3)
-    u2 = layers.Concatenate(axis=-1)([u2, e2])
-    u2 = layers.ConvLSTM2D(48, 3, padding='same', return_sequences=True)(u2)
+    u2 = TimeDistributed(UpSampling2D(2))(u3)
+    u2 = Concatenate(axis=-1)([u2, e2])
+    u2 = ConvLSTM2D(48, 3, padding='same', return_sequences=True)(u2)
     u2 = ConvLSTMAttentionBlock(48,reduction=reduction)(u2)
 
-    u1 = layers.TimeDistributed(layers.UpSampling2D(2))(u2)
-    u1 = layers.Concatenate(axis=-1)([u1, e1])
-    u1 = layers.ConvLSTM2D(24, 3, padding='same', return_sequences=True)(u1)
+    u1 = TimeDistributed(UpSampling2D(2))(u2)
+    u1 = Concatenate(axis=-1)([u1, e1])
+    u1 = ConvLSTM2D(24, 3, padding='same', return_sequences=True)(u1)
     u1 = ConvLSTMAttentionBlock(24,reduction=reduction)(u1)
 
     # OUTPUT 
-    x = layers.ConvLSTM2D(
+    x = ConvLSTM2D(
         16, 3, padding='same',
         return_sequences=False
     )(u1)
 
-    out = layers.Conv2D(1, 1, padding='same')(x)
-    out = layers.Activation('linear', dtype='float32', name='predictions')(out)
+    out = Conv2D(1, 1, padding='same')(x)
+    out = Activation('linear', dtype='float32', name='predictions')(out)
 
-    return models.Model(inputs, out, name="ConvLSTM_UNet_Att128")
+    return Model(inputs, out, name="ConvLSTM_UNet_Att128")

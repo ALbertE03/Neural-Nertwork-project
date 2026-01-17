@@ -1,3 +1,7 @@
+import tensorflow as tf
+import json
+import matplotlib.pyplot as plt
+
 class SaveHistoryCallback(tf.keras.callbacks.Callback):
     def __init__(self, filepath):
         super().__init__()

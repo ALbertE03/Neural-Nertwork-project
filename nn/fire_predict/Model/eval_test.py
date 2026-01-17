@@ -6,7 +6,9 @@ from tqdm import tqdm
 import tensorflow as tf
 import scipy.ndimage as ndimage
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve, roc_curve, auc
-
+from model import build_convlstm_bottleneck128
+from constants import best_checkpoint_path
+from test_dataset import InferenceTS
 
 def get_tolerant_labels(y_true, pixels=2):
     """Dilata las etiquetas reales para permitir un margen de error espacial (Buffer)."""
@@ -33,7 +35,7 @@ if Path(weights_path).exists():
 else:
     print("[!] Error: No se encontraron los pesos en la ruta especificada.")
 
-ds_inference = InferenceTF(path_valid=test, cache_dir=cache_base/'test')
+ds_inference = InferenceTS(path_valid=test, cache_dir=cache_base/'test')
 
 
 metrics_accum = {
