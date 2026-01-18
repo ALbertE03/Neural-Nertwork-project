@@ -89,7 +89,7 @@ def main():
         )
     ]
 
-    print(f"\nIniciando entrenamiento: Pure ConvLSTM + Aggressive Loss")
+    print(f"\nIniciando entrenamiento")
 
     steps_per_epoch = len(train_dataset) // BATCH_SIZE
     validation_steps = len(val_dataset) // BATCH_SIZE
