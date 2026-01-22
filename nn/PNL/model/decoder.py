@@ -91,23 +91,23 @@ class Decoder(nn.Module):
         """
         batch_size = decoder_input.size(0)
         
-        # 1. Embeddings del input
+        #  Embeddings del input
         embedded = self.embedding(decoder_input)  # (batch_size, embedding_size)
         embedded = self.dropout(embedded)
         embedded = embedded.unsqueeze(1)  # (batch_size, 1, embedding_size)
         
-        # 2. Concatenar con context vector si hay atención
+        # Concatenar con context vector si hay atención
         if self.is_attention and context_vector is not None:
             lstm_input = torch.cat([embedded, context_vector.unsqueeze(1)], dim=2)
         else:
             lstm_input = embedded
         
-        # 3. LSTM step
+        #  LSTM step
         lstm_output, decoder_state = self.lstm(lstm_input, decoder_state)
         # lstm_output: (batch_size, 1, hidden_size)
         lstm_output = lstm_output.squeeze(1)  # (batch_size, hidden_size)
         
-        # 4. Calcular atención
+        #  Calcular atención
         if self.is_attention:
             context_vector, attention_dist, coverage = self.attention(
                 lstm_output, encoder_outputs, encoder_mask, coverage
@@ -117,7 +117,7 @@ class Decoder(nn.Module):
         else:
             attention_dist = None
         
-        # 5. Generar distribución de vocabulario
+        #  Generar distribución de vocabulario
         if self.is_attention:
             vocab_input = torch.cat([lstm_output, context_vector], dim=1)
         else:
@@ -126,7 +126,7 @@ class Decoder(nn.Module):
         vocab_logits = self.vocab_proj(vocab_input)  # (batch_size, vocab_size)
         vocab_dist = F.softmax(vocab_logits, dim=1)  # (batch_size, vocab_size)
         
-        # 6. Pointer-Generator mechanism
+        #  Pointer-Generator mechanism
         p_gen = None
         if self.is_pgen and self.is_attention:
             # Calcular p_gen

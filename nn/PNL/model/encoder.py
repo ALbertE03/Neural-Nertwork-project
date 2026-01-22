@@ -60,10 +60,10 @@ class Encoder(nn.Module):
         """
         batch_size, src_len = encoder_input.size()
         
-        # 1. Embeddings
+        #  Embeddings
         embedded = self.embedding(encoder_input)  # (batch_size, src_len, embedding_size)
         embedded = self.dropout(embedded)
-        # 2. Pack padded sequence para eficiencia
+        #  Pack padded sequence para eficiencia
         packed = nn.utils.rnn.pack_padded_sequence(
             embedded, 
             encoder_length.cpu(), 
@@ -71,10 +71,10 @@ class Encoder(nn.Module):
             enforce_sorted=False
         )
         
-        # 3. LSTM
+        # LSTM
         packed_outputs, (h_n, c_n) = self.lstm(packed)
         
-        # 4. Unpack
+        #  Unpack
         encoder_outputs, _ = nn.utils.rnn.pad_packed_sequence(
             packed_outputs, 
             batch_first=True,
@@ -82,7 +82,7 @@ class Encoder(nn.Module):
         )
         # encoder_outputs: (batch_size, src_len, hidden_size * 2)
         
-        # 5. Reducir hidden states si es bidireccional
+        # Reducir hidden states si es bidireccional
         if self.bidirectional:
             # h_n: (num_layers * 2, batch_size, hidden_size)
             # Tomar última capa: (2, batch_size, hidden_size)

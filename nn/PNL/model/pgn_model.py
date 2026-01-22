@@ -87,7 +87,7 @@ class PointerGeneratorNetwork(nn.Module):
         batch_size, tgt_len = decoder_input.size()
         src_len = encoder_input.size(1)
         
-        # 1. Encoder
+        #  Encoder
         encoder_outputs, decoder_state = self.encoder(encoder_input, encoder_length)
         # encoder_outputs: (batch_size, src_len, hidden_size * 2)
         # decoder_state: Tuple (h, c) - (1, batch_size, hidden_size)
@@ -96,7 +96,7 @@ class PointerGeneratorNetwork(nn.Module):
         context_vector = torch.zeros(batch_size, self.config['hidden_size'] * 2, device=self.device)
         coverage = torch.zeros(batch_size, src_len, device=self.device) if self.is_coverage else None
         
-        # 3. Decoder loop (teacher forcing)
+        #  Decoder loop (teacher forcing)
         final_dists = []
         attention_dists = []
         coverages = []
@@ -123,7 +123,7 @@ class PointerGeneratorNetwork(nn.Module):
         final_dists = torch.stack(final_dists, dim=1)  # (batch_size, tgt_len, extended_vocab_size)
         attention_dists = torch.stack(attention_dists, dim=1)  # (batch_size, tgt_len, src_len)
         
-        # 4. Calcular loss
+        # Calcular loss
         vocab_loss = self._calculate_vocab_loss(final_dists, decoder_target)
         
         coverage_loss = torch.tensor(0.0, device=self.device)
@@ -131,7 +131,7 @@ class PointerGeneratorNetwork(nn.Module):
             coverages = torch.stack(coverages, dim=1)  # (batch_size, tgt_len, src_len)
             coverage_loss = self._calculate_coverage_loss(attention_dists, coverages, encoder_mask)
         
-        # Loss total (aplicar lambda al coverage loss)
+        # Loss total 
         total_loss = vocab_loss + self.coverage_lambda * coverage_loss
         
         return {

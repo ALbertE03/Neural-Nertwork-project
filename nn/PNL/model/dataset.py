@@ -98,11 +98,11 @@ class PGNDataset(Dataset):
         src_line = self.src_lines[idx].strip()
         tgt_line = self.tgt_lines[idx].strip()
         
-        # --- 1. Head truncation por oraciones ---
+        #  Head truncation por oraciones 
         
         raw_sentences = src_line.split(" . ")
             
-        # --- 1. Head truncation por oraciones ---
+        # Head truncation por oraciones 
         if self.is_tokenized:
             # Si ya está tokenizado, recuperamos las oraciones separando por "[.]"
             raw_sentences = src_line.split(" [.] ")
@@ -111,7 +111,6 @@ class PGNDataset(Dataset):
         
         for sentence in raw_sentences:
             if self.is_tokenized:
-                # Fast path: Ya está tokenizado por palabras
                 sentence_tokens = sentence.split()
                 tokens_to_add = sentence_tokens
             else:
@@ -122,7 +121,7 @@ class PGNDataset(Dataset):
             
             trimmed_src_tokens.extend(tokens_to_add)
         
-        # --- 2. Encoder con OOVs ---
+        #  Encoder con OOVs 
         ext_src_ids, ext_vocab_size, oov_map, oov_words = \
             self._get_extended_src_ids(trimmed_src_tokens)
         
@@ -139,14 +138,10 @@ class PGNDataset(Dataset):
             for i in extended_encoder_input
         ]
         
-        # --- 3. Decoder ---
+        # Decoder 
         if self.is_tokenized:
-            # Asumimos que el target tokenizado está separado por espacios
-            # Si hay separadores de oraciones [.] los tratamos como tokens o los ignoramos según el caso
-            # Aquí simplemente hacemos split por espacios
             tgt_tokens = tgt_line.strip().split()
         else:
-            # Fallback para texto crudo
             tgt_tokens = tgt_line.strip().split()
         
         tgt_ext_ids = self._map_target_to_extended_ids(tgt_tokens, oov_map)
@@ -171,7 +166,7 @@ class PGNDataset(Dataset):
         decoder_input = decoder_input_ids[:self.MAX_LEN_TGT]
         decoder_output = decoder_output_ids[:self.MAX_LEN_TGT]
         
-        # --- 4. Información adicional ---
+        # Información adicional 
         encoder_length = len(trimmed_src_tokens)
         # Mask será dinámica en collate, aquí solo devolvemos el largo real
         # encoder_mask = [1] * encoder_length + [0] * (self.MAX_LEN_SRC - encoder_length)
@@ -204,7 +199,7 @@ def pgn_collate_fn(batch):
     batch = filter_batch
     max_oov = max(x["max_oov_len"] for x in batch)
     
-    # 1. Obtener lengths máximos del batch actual (Dynamic Batching)
+    # Obtener lengths máximos del batch actual (Dynamic Batching)
     max_enc_len = max(x["encoder_length"].item() for x in batch)
     max_dec_len = max(len(x["decoder_input"]) for x in batch)
     
