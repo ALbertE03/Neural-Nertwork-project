@@ -101,3 +101,28 @@ class TolerantF1Score(tf.keras.metrics.Metric):
         self.fp.assign(0.0)
         self.fn.assign(0.0)
       
+
+
+
+class BinaryF1Score(tf.keras.metrics.Metric):
+    def __init__(self, name='f1_score', threshold=0.5, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.f1 = tf.keras.metrics.F1Score(
+            name='f1', 
+            threshold=threshold, 
+            average='weighted'
+        )
+        
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        # Aplanar las dimensiones espaciales (height, width)
+        y_true_flat = tf.reshape(y_true, [-1, tf.shape(y_true)[-1]])
+        y_pred_flat = tf.reshape(y_pred, [-1, tf.shape(y_pred)[-1]])
+        
+        # Actualizar métrica F1
+        self.f1.update_state(y_true_flat, y_pred_flat, sample_weight)
+        
+    def result(self):
+        return self.f1.result()
+        
+    def reset_state(self):
+        self.f1.reset_state()

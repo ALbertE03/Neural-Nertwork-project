@@ -10,15 +10,13 @@ class InferenceTS(TSDataset):
         self.target_size = 512
         self.patch_size = 256
 
-    def _read_and_rescale(self, dataset, bands, window=None, is_label=False):
-        """
-        Lee y reescala una imagen a 512x512.
-        """
+    def _read_and_rescale(self, dataset, bands, is_label=False):
         resampling_mode = Resampling.nearest if is_label else Resampling.bilinear
+        band_indices = bands if bands is not None else list(range(1, dataset.count + 1))
         
         data = dataset.read(
-            bands,
-            out_shape=(len(bands) if bands else dataset.count, self.target_size, self.target_size),
+            band_indices,
+            out_shape=(len(band_indices), self.target_size, self.target_size),
             resampling=resampling_mode
         )
         return self._normalize(data, is_label=is_label)
@@ -26,37 +24,34 @@ class InferenceTS(TSDataset):
     def __getitem__(self, idx):
         info = self.samples[idx]
         region = self.raw_paths[info["region"]]
-        t_start = info["t_start"]
+        dates = info["dates"] 
 
         full_seq_512 = [] 
-        
-        for t in range(t_start, t_start + self.seq_len):
+        for t_date in dates[:-1]:
             # VIIRS Day 
-            with rasterio.open(region["VIIRS_Day"][t]) as dsrc:
+            with rasterio.open(region["VIIRS_Day"][t_date]) as dsrc:
                 day = self._read_and_rescale(dsrc, [1, 2, 3, 4, 5, 6])
                 fire_today = self._read_and_rescale(dsrc, [7], is_label=True)
 
             # VIIRS Night
-            with rasterio.open(region["VIIRS_Night"][t]) as nsrc:
-               
-                num_bands = nsrc.count
-                night = self._read_and_rescale(nsrc, [num_bands-1, num_bands])
+            if t_date in region["VIIRS_Night"]:
+                with rasterio.open(region["VIIRS_Night"][t_date]) as nsrc:
+                    num_bands = nsrc.count
+                    night = self._read_and_rescale(nsrc, [num_bands-1, num_bands])
+            else:
+                night = np.zeros((2, self.target_size, self.target_size), dtype=np.float32)
 
             # FirePred
-            with rasterio.open(region["FirePred"][t]) as fsrc:
+            with rasterio.open(region["FirePred"][t_date]) as fsrc:
                 firep = self._read_and_rescale(fsrc, None)
 
             combined_t = np.concatenate([day, fire_today, night, firep], axis=0)
             full_seq_512.append(combined_t)
 
-        # Convertir a tensor
         full_seq_tensor = np.stack(full_seq_512)
 
-        # Dividir en 4 parches de 256x256
         patches = []
-        # Cuadrantes: Top-Left, Top-Right, Bottom-Left, Bottom-Right
         offsets = [(0, 0), (0, 256), (256, 0), (256, 256)]
-        
         for (y, x) in offsets:
             patch = full_seq_tensor[:, :, y:y+256, x:x+256]
             patches.append(patch)
@@ -68,76 +63,33 @@ class InferenceTS(TSDataset):
 
     def predict_full_image(self, model, patches_tensor):
         """
-        Predice los 4 parches y los une. 
+        Predice los 4 parches y los une en una imagen de 512x512.
         """
-        patches_np = patches_tensor
-        patches_tf = np.transpose(patches_np, (0, 1, 3, 4, 2))
+        # patches_tensor viene como [4, T, C, 256, 256]
+        patches_tf = np.transpose(patches_tensor, (0, 1, 3, 4, 2))
         
         preds = []
         for i in range(4):
-            patch = patches_tf[i:i+1] # Shape: (1, T, 256, 256, C)
-            
-            # (1, 256, 256, 1)
+            patch = patches_tf[i:i+1] # (1, T, 256, 256, C)
             p = model.predict(patch, verbose=0)
         
             p_prob = tf.nn.sigmoid(p).numpy()
-            preds.append(np.squeeze(p_prob))
+            preds.append(np.squeeze(p_prob)) # (256, 256)
 
-        # Reconstrucción 2x2 para formar la imagen de 512x512
+        # Reconstrucción de la cuadrícula 2x2
         top = np.concatenate([preds[0], preds[1]], axis=1)
         bottom = np.concatenate([preds[2], preds[3]], axis=1)
         return np.concatenate([top, bottom], axis=0) # [512, 512]
 
     def get_ground_truth(self, idx):
-        """Extrae el target real de 512x512 reescalado correctamente"""
         info = self.samples[idx]
         region = self.raw_paths[info["region"]]
-        t_target = info["t_start"] + self.seq_len
+        target_date = info["dates"][-1]
         
-        with rasterio.open(region["VIIRS_Day"][t_target]) as dsrc:
-            
+        with rasterio.open(region["VIIRS_Day"][target_date]) as dsrc:
             y_true = dsrc.read(
                 7, 
                 out_shape=(self.target_size, self.target_size), 
                 resampling=Resampling.nearest
             )
             return self._normalize(y_true, is_label=True)
-
-    def evaluate_tolerantly(self, y_true, y_pred_prob, tol_ksize=5, threshold=0.5):
-        """
-        Calcula F1 y Recall usando la misma lógica de tolerancia que el entrenamiento.
-        y_true: [512, 512]
-        y_pred_prob: [512, 512] (probabilidades 0-1)
-        """
-        # Convertir a tensores de 4D para pooling [Batch, H, W, Channels]
-        y_true_t = tf.cast(y_true[np.newaxis, ..., np.newaxis], tf.float32)
-        y_pred_t = tf.cast(y_pred_prob[np.newaxis, ..., np.newaxis], tf.float32)
-        
-        y_pred_bin = tf.cast(y_pred_t > threshold, tf.float32)
-
-        # Crear máscara de tolerancia 
-        y_true_tol = tf.nn.max_pool2d(
-            y_true_t, ksize=tol_ksize, strides=1, padding='SAME'
-        )
-
-        #  Métricas Tolerantes 
-        # True Positives correcta dentro de zona tolerante
-        tp = tf.reduce_sum(y_pred_bin * y_true_tol)
-        
-        # False Positives Fuera de la zona de tolerancia
-        fp = tf.reduce_sum(y_pred_bin * (1.0 - y_true_tol))
-        
-        # False Negatives
-        y_pred_tol = tf.nn.max_pool2d(y_pred_bin, ksize=tol_ksize, strides=1, padding='SAME')
-        fn = tf.reduce_sum(y_true_t * (1.0 - y_pred_tol))
-
-        # Cálculos finales
-        precision = tp / (tp + fp + 1e-7)
-        recall = tp / (tp + fn + 1e-7)
-        f1 = 2 * (precision * recall) / (precision + recall + 1e-7)
-
-        return {
-            "f1_tolerant": f1.numpy(),
-            "recall_tolerant": recall.numpy(),
-            "precision_tolerant": precision.numpy()
-        }

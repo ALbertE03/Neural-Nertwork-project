@@ -10,8 +10,10 @@ from model import build_convlstm_bottleneck128
 from constants import best_checkpoint_path
 from test_dataset import InferenceTS
 
+
+
 def get_tolerant_labels(y_true, pixels=2):
-    """Dilata las etiquetas reales para permitir un margen de error espacial (Buffer)."""
+    """Dilata las etiquetas reales para permitir un margen de error espacial."""
     struct = ndimage.generate_binary_structure(2, 1)
     struct = ndimage.iterate_structure(struct, pixels)
     return ndimage.binary_dilation(y_true, structure=struct).astype(np.uint8)
@@ -34,6 +36,7 @@ if Path(weights_path).exists():
     print(f"[*] Pesos cargados correctamente desde {weights_path}")
 else:
     print("[!] Error: No se encontraron los pesos en la ruta especificada.")
+    raise
 
 ds_inference = InferenceTS(path_valid=test, cache_dir=cache_base/'test')
 
@@ -158,5 +161,4 @@ ax3.set_title("Resumen de Performance del Modelo ConvLSTM", pad=20, fontsize=16,
 plt.tight_layout()
 plt.show()
 
-# Guardar resultados
 pd.DataFrame([metrics_accum]).to_csv("pixel_counts_final.csv", index=False)

@@ -5,7 +5,7 @@ from tensorflow.keras import mixed_precision
 from callbacks import SaveHistoryCallback,VisualVerifyCallback
 from loss import FocalDiceLoss
 from constants import BATCH_SIZE,INPUT_SHAPE,DROPOUT,REDUCTION,GAMMA,ALPHA,SMOOTH,last_checkpoint_path,history_path,best_checkpoint_path
-from metrics import TolerantRecall,TolerantFalseNegatives,TolerantF1Score
+from metrics import TolerantRecall,TolerantFalseNegatives,TolerantF1Score,BinaryF1Score
 from model import build_convlstm_bottleneck128
 
 policy = mixed_precision.Policy('mixed_float16')
@@ -19,12 +19,19 @@ def main():
 
     # Metricas
     metrics = [
+     
         TolerantRecall(name="tol_recall"),
         TolerantFalseNegatives(name="tol_fn"),
-        TolerantF1Score(name="f1_score"), 
+        TolerantF1Score(name="tol_f1_score"), 
+        
+        BinaryF1Score(name="f1_score", threshold=0.5),
         tf.keras.metrics.BinaryIoU(target_class_ids=[1], name="iou"), 
-        tf.keras.metrics.Precision(name="precision")
+        tf.keras.metrics.Precision(name="precision"),
+        tf.keras.metrics.BinaryAccuracy(name="accuracy"),
+        tf.keras.metrics.Recall(name="recall"),    
+        tf.keras.metrics.FalseNegatives(name="fn") 
     ]
+
 
 
     model = build_convlstm_bottleneck128(input_shape=INPUT_SHAPE,dropout=DROPOUT,reduction=REDUCTION)
