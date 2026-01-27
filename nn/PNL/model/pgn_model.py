@@ -92,11 +92,11 @@ class PointerGeneratorNetwork(nn.Module):
         # encoder_outputs: (batch_size, src_len, hidden_size * 2)
         # decoder_state: Tuple (h, c) - (1, batch_size, hidden_size)
         
-        # 2. Inicializar
+        # Inicializar
         context_vector = torch.zeros(batch_size, self.config['hidden_size'] * 2, device=self.device)
         coverage = torch.zeros(batch_size, src_len, device=self.device) if self.is_coverage else None
         
-        #  Decoder loop (teacher forcing)
+        #  Decoder loop 
         final_dists = []
         attention_dists = []
         coverages = []
@@ -193,7 +193,7 @@ class PointerGeneratorNetwork(nn.Module):
         # Coverage loss = sum_t min(a_t, c_t)
         # Penaliza cuando atendemos posiciones ya atendidas
         
-        # Shift coverage: usamos coverage del paso anterior
+        # coverage: usamos coverage del paso anterior
         coverage_prev = torch.cat([
             torch.zeros_like(coverages[:, :1, :]),  # t=0 no tiene coverage previo
             coverages[:, :-1, :]  # t>0 usa coverage de t-1

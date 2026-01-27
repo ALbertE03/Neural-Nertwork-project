@@ -62,7 +62,7 @@ def analyze_extractiveness(src_path, tgt_path, num_samples=200000):
         print(f"Error: {e}")
         return
 
-    print("\n--- Extractiveness Results ---")
+    print("\nExtractiveness Results")
     print("\n[Word Level - Novel n-grams % (Lower is more extractive)]")
     for n in range(1, 4):
         avg_novel = sum(metrics[n]) / len(metrics[n]) if metrics[n] else 0
