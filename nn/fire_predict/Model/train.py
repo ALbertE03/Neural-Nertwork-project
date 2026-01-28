@@ -3,7 +3,7 @@ import json
 import os
 from tensorflow.keras import mixed_precision
 from callbacks import SaveHistoryCallback,VisualVerifyCallback
-from loss import FocalDiceLoss
+from loss import DiceLoss
 from constants import BATCH_SIZE,INPUT_SHAPE,DROPOUT,REDUCTION,GAMMA,ALPHA,SMOOTH,last_checkpoint_path,history_path,best_checkpoint_path
 from metrics import TolerantRecall,TolerantFalseNegatives,TolerantF1Score,BinaryF1Score
 from model import build_convlstm_bottleneck128
@@ -60,7 +60,7 @@ def main():
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, clipnorm=CLIPNORM),
-        loss=FocalDiceLoss(gamma=GAMMA,alpha=ALPHA,smooth=SMOOTH),
+        loss=DiceLoss(smooth=SMOOTH),
         metrics=metrics
     )
 
